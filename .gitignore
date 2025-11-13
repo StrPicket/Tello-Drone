@@ -1,0 +1,13 @@
+# Entorno virtual
+tello_env/
+
+# Carpetas no deseadas
+RoboMaster-SDK/
+
+# Python
+__pycache__/
+*.pyc
+
+# Datasets (opcional)
+datasets/
+datasetDron/
