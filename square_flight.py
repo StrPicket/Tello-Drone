@@ -24,18 +24,20 @@ if __name__ == '__main__':
 
     for i in range(2):
         for j in range(7):
+            print(j)
             tl_flight.forward(distance=60).wait_for_completed()
-            if j % 2 == 0:
-                tl_flight.right(distance=10).wait_for_completed()
+            if j % 2 == 1:
+                tl_flight.rotate(angle=5).wait_for_completed()
             time.sleep(1)
-        tl_flight.rotate(angle=90).wait_for_completed()
+        tl_flight.rotate(angle=75).wait_for_completed()
         time.sleep(1)
         for k in range(6):
+            print(k)
             tl_flight.forward(distance=60).wait_for_completed()
-            if k % 2 == 0:
-                tl_flight.right(distance=10).wait_for_completed()
+            if k % 2 == 1:
+                tl_flight.rotate(angle=5).wait_for_completed()
             time.sleep(1)
-        tl_flight.rotate(angle=90).wait_for_completed()
+        tl_flight.rotate(angle=75).wait_for_completed()
         time.sleep(1)
 
     # Set the QUAV to land
