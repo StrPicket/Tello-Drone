@@ -288,6 +288,8 @@ if __name__ == "__main__":
                 correction_phase()
             
             move_forward_safe()
+            segment_counter += 1
+            print(f"\nSegmento {segment_counter}")
             time.sleep(3.0)
 
             for k in range(2):  # AJUSTA ESTE NÚMERO
