@@ -370,15 +370,16 @@ if __name__ == "__main__":
             
             # 5 segmentos normales
             for j in range(5):
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-                move_forward_safe()
-                correction_phase()
+                if j == 4 : # Segmento final antes de rotar
+                    move_forward_safe()
+                    segment_counter += 1
+                    print(f"\nSeg {segment_counter}")
 
-            # Segmento final antes de rotar
-            move_forward_safe()
-            segment_counter += 1
-            print(f"\nSeg {segment_counter}")
+                else:
+                    segment_counter += 1
+                    print(f"\nSeg {segment_counter}")
+                    move_forward_safe()
+                    correction_phase()
             
             print("Pipe LARGO OK")
             rotate_left_90()
