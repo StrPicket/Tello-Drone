@@ -14,12 +14,12 @@ tl_camera = tl_drone.camera
 tl_camera.start_video_stream(display=False)
 
 # === Cargar modelo YOLO ===
-model = YOLO("best.pt")
+model = YOLO("best.pt")  # cambia el nombre si tu modelo se llama distinto
 
 # ============================================================
-# CONFIGURACIÓN DE CORRECCIÓN (adaptado de Drone1_routine.py)
+# CONFIGURACIÓN DE CORRECCIÓN (FIRE)
 # ============================================================
-TARGET_CLASS = "FIRE"  # ← nombre EXACTO de la clase en tu modelo
+TARGET_CLASS = "FIRE"  # nombre EXACTO de la clase en tu modelo
 
 KP = 0.25
 KD = 0.2
@@ -28,7 +28,7 @@ MAX_SPEED = 30         # velocidad máx. en rc()
 CORRECTION_TIME = 8.0  # tiempo máx. intentando centrar FIRE (s)
 
 # ============================================================
-# WAYPOINTS fire 3,0 ; 6,1; 6,4; 6,7; 0,7
+# WAYPOINTS (ACTUALIZADOS)
 # ============================================================
 wpX = [3, 6, 6, 0]
 wpY = [0, 1, 4, 0]
@@ -41,14 +41,14 @@ heading = 0
 
 
 # ============================================================
-# FUNCIONES DE VISIÓN Y CORRECCIÓN
+# FUNCIONES DE VISIÓN
 # ============================================================
 def get_fire_centroid(frame_bgr):
     """
     Ejecuta YOLO sobre el frame y devuelve el centro (cx, cy) de la mejor
     detección de la clase TARGET_CLASS. Si el modelo tiene máscaras,
     se usa el centroide de la máscara; si no, el centro del bounding box.
-    """          
+    """
     results = model(frame_bgr, conf=0.3, verbose=False)
     if not results:
         return None
@@ -94,12 +94,16 @@ def get_fire_centroid(frame_bgr):
     return cx, cy
 
 
+# ============================================================
+# FUNCIÓN DE CORRECCIÓN + DEBUG DE CÁMARA
+# ============================================================
 def center_fire_and_go_down_up():
     """
     1. Busca FIRE en la imagen.
     2. Usa control PD sobre rc() para centrar FIRE horizontalmente.
-    3. Cuando está centrado, baja 20 cm, espera 5 s, y sube 20 cm.
-    4. Si no logra centrar FIRE en CORRECTION_TIME, sale sin mover altura.
+    3. Muestra la cámara con la detección en una ventana de OpenCV ("FIRE debug").
+    4. Cuando está centrado, baja 20 cm, espera 5 s, y sube 20 cm.
+    5. Si no logra centrar FIRE en CORRECTION_TIME, sale sin mover altura.
     """
     print("=== BUSCANDO Y CENTRANDO FIRE ===")
 
@@ -113,7 +117,7 @@ def center_fire_and_go_down_up():
 
     while time.time() - start_time < CORRECTION_TIME:
         # Leer último frame de la cámara
-        # La mayoría de ejemplos del SDK usan strategy="newest"
+        # (según versión del SDK puede ser solo read_cv2_image())
         frame = tl_camera.read_cv2_image(strategy="newest")
         if frame is None:
             time.sleep(0.02)
@@ -124,17 +128,29 @@ def center_fire_and_go_down_up():
         h, w = frame_bgr.shape[:2]
         center_x = w // 2
 
+        # Detección FIRE
         centroid = get_fire_centroid(frame_bgr)
         current_time = time.time()
         dt = current_time - prev_time
         if dt < 0.001:
             dt = 0.001
 
+        # DIBUJO: línea vertical en el centro
+        cv2.line(frame_bgr, (center_x, 0), (center_x, h), (0, 255, 0), 2)
+
         if centroid is None:
             # No se ve FIRE, parar movimiento lateral
             tl_flight.rc(a=0, b=0, c=0, d=0)
             error_history.clear()
             print("   FIRE no detectado...")
+
+            # Mostrar solo la imagen con la línea central
+            cv2.imshow("FIRE debug", frame_bgr)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("   Se presionó 'q', abortando corrección FIRE.")
+                break
+
         else:
             cx, cy = centroid
             last_centroid = centroid
@@ -146,6 +162,16 @@ def center_fire_and_go_down_up():
             error_filtered = int(np.mean(error_history))
 
             print(f"   FIRE detectado en x={cx}, error={error_filtered} px")
+
+            # DIBUJO: punto donde está el FIRE
+            cv2.circle(frame_bgr, (cx, cy), 6, (0, 0, 255), -1)
+
+            # Mostrar imagen con FIRE y línea central
+            cv2.imshow("FIRE debug", frame_bgr)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("   Se presionó 'q', abortando corrección FIRE.")
+                break
 
             # ¿Ya está suficientemente centrado?
             if abs(error_filtered) <= DEADZONE:
@@ -179,6 +205,12 @@ def center_fire_and_go_down_up():
     # Parar siempre el rc al salir
     tl_flight.rc(a=0, b=0, c=0, d=0)
 
+    # Cerrar la ventana de debug
+    try:
+        cv2.destroyWindow("FIRE debug")
+    except:
+        pass
+
     # Si se centró FIRE, ejecutar la maniobra de bajar-guardar-subir
     if centered and last_centroid is not None:
         print(">>> FIRE centrado: bajando 20 cm...")
@@ -199,6 +231,7 @@ def center_fire_and_go_down_up():
 # ============================================================
 if __name__ == "__main__":
 
+    # Despegar
     tl_flight.takeoff().wait_for_completed()
     time.sleep(2)
 
@@ -210,7 +243,7 @@ if __name__ == "__main__":
         # Ángulo objetivo respecto al mundo
         target_angle = np.rad2deg(np.arctan2(dy, dx))
 
-        # Angulo respecto al heading actual
+        # Ángulo respecto al heading actual
         turn_angle = target_angle - heading
 
         # Normalizar a -180..180
@@ -230,14 +263,14 @@ if __name__ == "__main__":
 
         tl_flight.forward(distance).wait_for_completed()
         print("Waypoint alcanzado")
+        time.sleep(5)
+        print("-----")
 
-        # === NUEVO: fase de corrección para FIRE en cada waypoint ===
+        # === Fase de corrección FIRE en cada waypoint ===
         try:
             center_fire_and_go_down_up()
         except Exception as e:
             print(f"Error en fase FIRE: {e}")
-
-        print("-----")
 
         # Actualizar posición y orientación
         positionX = wpX[i]
