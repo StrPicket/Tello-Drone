@@ -17,20 +17,22 @@ KD = 0.2
 DEADZONE = 60      
 MAX_SPEED = 18
 
-CORRECTION_TIME = 10.0  # ← Aumentado para dar más tiempo
+CORRECTION_TIME = 10.0
 STABILIZATION_TIME = 1.0
 INFERENCE_SIZE = 224
+INFERENCE_SIZE_LIGHT = 160  # ← NUEVO: para navegación ligera
 FRAME_SKIP = 2
 
 CAMERA_TRANSFORM = "flip_v"
 
 # ========== ROI AMPLIADO ==========
-ROI_LEFT_LIMIT = 80     # ← Mucho más a la derecha
+ROI_LEFT_LIMIT = 80
 ROI_TOP_LIMIT = 0
 ROI_BOTTOM_LIMIT = 480
-ROI_RIGHT_LIMIT = 880    # ← Rango completo (sin límite derecho)
+ROI_RIGHT_LIMIT = 880
 
-DEBUG_DETECTIONS = True   # ← NUEVO: Para ver qué detecta
+DEBUG_DETECTIONS = True
+ENABLE_VISUALIZATION = True  # ← NUEVO: False para desactivar ventana
 
 # ============================================================
 # SETUP
@@ -73,15 +75,38 @@ def continuous_detection_thread():
     global latest_frame, display_running, in_correction_mode, segment_counter
     
     detection_counter = 0
+    consecutive_failures = 0  # ← NUEVO: para reconexión automática
     
     while display_running:
         frame = frame_read.frame
+        
+        # ========== MANEJO DE ERRORES DE CÁMARA ==========
         if frame is None:
+            consecutive_failures += 1
+            if consecutive_failures > 50:  # ~1 segundo sin frames
+                print("⚠️ Reconectando stream...")
+                try:
+                    tello.streamoff()
+                    time.sleep(0.5)
+                    tello.streamon()
+                    time.sleep(2)
+                    consecutive_failures = 0
+                    print("✓ Stream reconectado")
+                except Exception as e:
+                    print(f"❌ Error reconexión: {e}")
             time.sleep(0.02)
             continue
         
+        consecutive_failures = 0  # ← Reset si hay frame válido
+        
         detection_counter += 1
-        if detection_counter % 2 != 0:
+        
+        # ========== PROCESAMIENTO ADAPTATIVO ==========
+        # Durante corrección: procesar cada 2 frames (rápido)
+        # Durante navegación: procesar cada 5 frames (más lento)
+        skip_rate = 2 if in_correction_mode else 5  # ← NUEVO
+        
+        if detection_counter % skip_rate != 0:
             time.sleep(0.01)
             continue
         
@@ -91,17 +116,24 @@ def continuous_detection_thread():
             h, w = frame_bgr.shape[:2]
             center_x = w // 2
             
-            # Inferencia
-            results = model(frame_bgr, conf=0.3, verbose=False, imgsz=INFERENCE_SIZE)
+            # ========== INFERENCIA ADAPTATIVA ==========
+            # Resolución más alta en corrección, más baja en navegación
+            inference_size = INFERENCE_SIZE if in_correction_mode else INFERENCE_SIZE_LIGHT
+            results = model(frame_bgr, conf=0.3, verbose=False, imgsz=inference_size)
             
             # Frame limpio para visualización
             vis_frame = frame_bgr.copy()
             
             # ========== DIBUJAR SOLO LO ESENCIAL ==========
             
-            # Línea vertical del ROI izquierdo (más gruesa para que se vea bien)
+            # Línea vertical del ROI izquierdo
             cv2.line(vis_frame, (ROI_LEFT_LIMIT, 0), (ROI_LEFT_LIMIT, h), (0, 0, 255), 3)
-            cv2.putText(vis_frame, "ROI", (ROI_LEFT_LIMIT + 5, 30), 
+            cv2.putText(vis_frame, "ROI_L", (ROI_LEFT_LIMIT + 5, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            
+            # Línea vertical del ROI derecho
+            cv2.line(vis_frame, (ROI_RIGHT_LIMIT, 0), (ROI_RIGHT_LIMIT, h), (0, 0, 255), 3)
+            cv2.putText(vis_frame, "ROI_R", (ROI_RIGHT_LIMIT - 80, 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
             # Centro de frame
@@ -132,7 +164,7 @@ def continuous_detection_thread():
                              y2 <= ROI_BOTTOM_LIMIT)
                     
                     # Color según clase y ROI
-                    if class_name.lower() == TARGET_CLASS.lower():
+                    if class_name.lower() in ['pipes', 'pipe', 'fire']:
                         color = (0, 255, 0) if in_roi else (128, 128, 128)
                     else:
                         color = (255, 165, 0)
@@ -148,10 +180,11 @@ def continuous_detection_thread():
                     # Centroide del bbox
                     cv2.circle(vis_frame, (cx_box, cy_box), 4, color, -1)
                 
-                # Procesar máscaras SOLO para TARGET_CLASS en ROI
+                # Procesar máscaras
                 if results[0].masks is not None:
                     for i, cls_id in enumerate(classes):
-                        if class_names[cls_id].lower() == TARGET_CLASS.lower():
+                        class_name = class_names[cls_id]
+                        if class_name.lower() in ['pipes', 'pipe', 'fire']:
                             mask = result.masks.data[i].cpu().numpy()
                             mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
                             mask_bin = (mask_resized > 0.5).astype(np.uint8)
@@ -188,9 +221,17 @@ def continuous_detection_thread():
             cv2.putText(vis_frame, mode_text, (10, info_y + 30), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2)
             
+            # Mostrar resolución de inferencia actual
+            inference_text = f"Infer:{inference_size}px"
+            cv2.putText(vis_frame, inference_text, (w - 120, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
             latest_frame = vis_frame
-            cv2.imshow("Tello Optimizado", vis_frame)
-            cv2.waitKey(1)
+            
+            # ========== VISUALIZACIÓN CONDICIONAL ==========
+            if ENABLE_VISUALIZATION:
+                cv2.imshow("Tello Optimizado", vis_frame)
+                cv2.waitKey(1)
             
         except Exception as e:
             print(f"Error display: {e}")
@@ -204,7 +245,6 @@ def sensor_calibration():
     """Calibración de sensores del drone"""
     print("    → Estabilizando sensores...")
     time.sleep(2)
-    # Pequeños movimientos para calibrar
     tello.send_rc_control(0, 0, 0, 0)
     time.sleep(0.5)
     print("    ✓ Calibración completa")
@@ -253,6 +293,7 @@ def count_pipes_in_roi(samples=5, verbose=False):
         frame_bgr = transform_frame(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         h, w = frame_bgr.shape[:2]
         
+        # Usar resolución más alta para conteo preciso
         results = model(frame_bgr, conf=0.3, verbose=False, imgsz=INFERENCE_SIZE)
         
         pipes_in_roi = 0
@@ -317,7 +358,7 @@ def correction_phase():
     error_buffer = deque(maxlen=4)
     last_control = 0
     corrections_made = 0
-    no_detection_count = 0  # ← NUEVO contador
+    no_detection_count = 0
     
     while time.time() - start_time < CORRECTION_TIME:
         frame = frame_read.frame
@@ -337,6 +378,7 @@ def correction_phase():
         h, w = frame_bgr.shape[:2]
         center_x = w // 2
         
+        # Usar resolución completa en corrección
         results = model(frame_bgr, conf=0.3, verbose=False, imgsz=INFERENCE_SIZE)
         
         pipe_found = False
@@ -357,14 +399,13 @@ def correction_phase():
             
             best_pipe_idx = None
             best_conf = 0
-            candidates_info = []  # ← NUEVO: para debug
+            candidates_info = []
             
             for i, cls_id in enumerate(classes):
                 class_name = class_names[cls_id]
                 
                 # ========== ACEPTAR PIPES Y FIRE ==========
-                # Cambia según lo que detecte tu modelo
-                if class_name.lower() in ['pipes', 'pipe', 'fire']:  # ← MODIFICADO
+                if class_name.lower() in ['pipes', 'pipe', 'fire']:
                     mask = result.masks.data[i].cpu().numpy()
                     mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
                     mask_bin = (mask_resized > 0.5).astype(np.uint8)
@@ -450,8 +491,10 @@ if __name__ == "__main__":
     try:
         print("\n=== CONFIGURACIÓN ===")
         print(f"Cam: {CAMERA_TRANSFORM}")
-        print(f"ROI: x > {ROI_LEFT_LIMIT}")
+        print(f"ROI: {ROI_LEFT_LIMIT} < x < {ROI_RIGHT_LIMIT}")
         print(f"Tiempo corrección: {CORRECTION_TIME}s")
+        print(f"Inferencia: {INFERENCE_SIZE}px (corrección) / {INFERENCE_SIZE_LIGHT}px (navegación)")
+        print(f"Visualización: {'Activada' if ENABLE_VISUALIZATION else 'Desactivada'}")
         time.sleep(3)
         
         input("Presiona ENTER para despegar...")
@@ -459,7 +502,6 @@ if __name__ == "__main__":
         print("\n=== DESPEGUE ===")
         tello.takeoff()
         
-        # SOLO ESPERA PASIVA - SIN COMANDOS
         print("⏳ Esperando 3s...")
         time.sleep(3)
         print("✓ Listo para iniciar")
@@ -467,8 +509,8 @@ if __name__ == "__main__":
         for i in range(2):
             print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
             
-            for j in range(6):
-                if j == 5:
+            for j in range(5):
+                if j == 6:
                     move_forward_safe()
                     segment_counter += 1
                     print(f"\nSeg {segment_counter}")
@@ -512,7 +554,7 @@ if __name__ == "__main__":
             rotate_left_90()
 
             for j in range(6):
-                if j == 5:
+                if j == 6:
                     move_forward_safe()
                     segment_counter += 1
                     print(f"\nSeg {segment_counter}")
