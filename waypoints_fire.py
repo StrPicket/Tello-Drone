@@ -1,285 +1,209 @@
-import cv2
+from djitellopy import Tello
+from ultralytics import YOLO
 import time
 import numpy as np
-from robomaster import robot
-from ultralytics import YOLO
+import cv2
 
-# === Inicializar dron ===
-tl_drone = robot.Drone()
-tl_drone.initialize()
-tl_flight = tl_drone.flight
+# ================================
+# Cargar modelo YOLO11
+# ================================
+model = YOLO("best.pt")
 
-# === Inicializar cámara ===
-tl_camera = tl_drone.camera
-tl_camera.start_video_stream(display=False)
+# ================================
+# Conectar Tello
+# ================================
+drone = Tello()
+drone.connect()
+drone.streamon()
 
-# === Cargar modelo YOLO ===
-model = YOLO("best.pt")  # cambia el nombre si tu modelo se llama distinto
+print("BATERÍA:", drone.get_battery(), "%")
 
 # ============================================================
-# CONFIGURACIÓN DE CORRECCIÓN (FIRE)
+# CONFIGURACIÓN CONTROL
 # ============================================================
-TARGET_CLASS = "FIRE"  # nombre EXACTO de la clase en tu modelo
+TARGET_CLASS = "Fire"
 
 KP = 0.25
 KD = 0.2
-DEADZONE = 40          # margen en píxeles para considerar centrado
-MAX_SPEED = 30         # velocidad máx. en rc()
-CORRECTION_TIME = 8.0  # tiempo máx. intentando centrar FIRE (s)
+DEADZONE = 40
+MAX_SPEED = 40
+CORRECTION_TIME = 8.0
 
 # ============================================================
-# WAYPOINTS (ACTUALIZADOS)
+# WAYPOINTS
 # ============================================================
 wpX = [3, 6, 6, 0]
 wpY = [0, 1, 4, 0]
 
 positionX = 0
 positionY = 0
-
-# Ángulo inicial del dron (en grados)
 heading = 0
 
 
 # ============================================================
-# FUNCIONES DE VISIÓN
+# DETECCIÓN DEL CENTRO DE "FIRE"
 # ============================================================
-def get_fire_centroid(frame_bgr):
-    """
-    Ejecuta YOLO sobre el frame y devuelve el centro (cx, cy) de la mejor
-    detección de la clase TARGET_CLASS. Si el modelo tiene máscaras,
-    se usa el centroide de la máscara; si no, el centro del bounding box.
-    """
-    results = model(frame_bgr, conf=0.3, verbose=False)
+def get_fire_centroid(frame):
+
+    results = model(frame, conf=0.3, verbose=False)
     if not results:
         return None
 
     result = results[0]
-    h, w = frame_bgr.shape[:2]
+    h, w = frame.shape[:2]
 
     if result.boxes is None:
         return None
 
     boxes = result.boxes.xyxy.cpu().numpy()
     classes = result.boxes.cls.cpu().numpy().astype(int)
-    confidences = result.boxes.conf.cpu().numpy()
-    class_names = result.names
+    confs = result.boxes.conf.cpu().numpy()
+    names = result.names
 
-    best_idx = None
-    best_conf = 0.0
+    best = None
+    best_conf = 0
 
-    # Buscar la detección FIRE con mayor confianza
-    for i, (box, cls_id, conf) in enumerate(zip(boxes, classes, confidences)):
-        class_name = class_names[cls_id]
-        if class_name.lower() == TARGET_CLASS.lower() and conf > best_conf:
-            best_idx = i
-            best_conf = conf
+    for box, cls_id, cf in zip(boxes, classes, confs):
+        cls_name = names[cls_id]
+        if cls_name.lower() == TARGET_CLASS.lower() and cf > best_conf:
+            best = box
+            best_conf = cf
 
-    if best_idx is None:
+    if best is None:
         return None
 
-    x1, y1, x2, y2 = boxes[best_idx].astype(int)
+    x1, y1, x2, y2 = best.astype(int)
     cx = (x1 + x2) // 2
     cy = (y1 + y2) // 2
-
-    # Si hay máscaras, refinar con el centroide de la máscara
-    if result.masks is not None and len(result.masks.data) > best_idx:
-        mask = result.masks.data[best_idx].cpu().numpy()
-        mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-        mask_bin = (mask_resized > 0.5).astype(np.uint8)
-        M = cv2.moments(mask_bin)
-        if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
 
     return cx, cy
 
 
 # ============================================================
-# FUNCIÓN DE CORRECCIÓN + DEBUG DE CÁMARA
+# CENTRAR Y BAJAR-SUBIR
 # ============================================================
 def center_fire_and_go_down_up():
-    """
-    1. Busca FIRE en la imagen.
-    2. Usa control PD sobre rc() para centrar FIRE horizontalmente.
-    3. Muestra la cámara con la detección en una ventana de OpenCV ("FIRE debug").
-    4. Cuando está centrado, baja 20 cm, espera 5 s, y sube 20 cm.
-    5. Si no logra centrar FIRE en CORRECTION_TIME, sale sin mover altura.
-    """
+
     print("=== BUSCANDO Y CENTRANDO FIRE ===")
 
-    start_time = time.time()
-    prev_time = start_time
+    start = time.time()
+    prev_time = start
     prev_error = 0
-    last_control = 0
-    error_history = []
+    last_cmd = 0
+    error_hist = []
     centered = False
-    last_centroid = None
 
-    while time.time() - start_time < CORRECTION_TIME:
-        # Leer último frame de la cámara
-        # (según versión del SDK puede ser solo read_cv2_image())
-        frame = tl_camera.read_cv2_image(strategy="newest")
+    while time.time() - start < CORRECTION_TIME:
+
+        frame = drone.get_frame_read().frame
         if frame is None:
-            time.sleep(0.02)
             continue
 
-        # RoboMaster suele devolver RGB; convertimos a BGR para OpenCV
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        h, w = frame_bgr.shape[:2]
+        h, w = frame.shape[:2]
         center_x = w // 2
 
-        # Detección FIRE
-        centroid = get_fire_centroid(frame_bgr)
-        current_time = time.time()
-        dt = current_time - prev_time
+        centroid = get_fire_centroid(frame)
+        now = time.time()
+        dt = now - prev_time
         if dt < 0.001:
             dt = 0.001
 
-        # DIBUJO: línea vertical en el centro
-        cv2.line(frame_bgr, (center_x, 0), (center_x, h), (0, 255, 0), 2)
-
         if centroid is None:
-            # No se ve FIRE, parar movimiento lateral
-            tl_flight.rc(a=0, b=0, c=0, d=0)
-            error_history.clear()
-            print("   FIRE no detectado...")
-
-            # Mostrar solo la imagen con la línea central
-            cv2.imshow("FIRE debug", frame_bgr)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("   Se presionó 'q', abortando corrección FIRE.")
-                break
-
+            drone.send_rc_control(0, 0, 0, 0)
+            print("   FIRE no detectado…")
         else:
             cx, cy = centroid
-            last_centroid = centroid
-            error = cx - center_x   # error horizontal (px)
+            error = cx - center_x
 
-            error_history.append(error)
-            if len(error_history) > 4:
-                error_history.pop(0)
-            error_filtered = int(np.mean(error_history))
+            error_hist.append(error)
+            if len(error_hist) > 4:
+                error_hist.pop(0)
+            error_f = int(np.mean(error_hist))
 
-            print(f"   FIRE detectado en x={cx}, error={error_filtered} px")
+            print(f"   FIRE detectado en x={cx}, error={error_f}")
 
-            # DIBUJO: punto donde está el FIRE
-            cv2.circle(frame_bgr, (cx, cy), 6, (0, 0, 255), -1)
-
-            # Mostrar imagen con FIRE y línea central
-            cv2.imshow("FIRE debug", frame_bgr)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("   Se presionó 'q', abortando corrección FIRE.")
-                break
-
-            # ¿Ya está suficientemente centrado?
-            if abs(error_filtered) <= DEADZONE:
-                tl_flight.rc(a=0, b=0, c=0, d=0)
-                centered = True
+            if abs(error_f) <= DEADZONE:
                 print("   FIRE centrado.")
+                centered = True
                 break
 
             # Control PD
-            p_term = KP * error_filtered
-            d_term = KD * (error_filtered - prev_error) / dt
-            control = p_term + d_term
+            p = KP * error_f
+            d = KD * (error_f - prev_error) / dt
+            cmd = p + d
 
-            # Limitar cambios bruscos respecto al último control
-            if abs(control - last_control) > 10:
-                control = last_control + np.sign(control - last_control) * 10
+            if abs(cmd - last_cmd) > 10:
+                cmd = last_cmd + np.sign(cmd - last_cmd) * 10
 
-            control = int(np.clip(control, -MAX_SPEED, MAX_SPEED))
+            cmd = int(max(min(cmd, MAX_SPEED), -MAX_SPEED))
 
-            # En RoboMaster, rc(a=20) mueve a la IZQUIERDA.
-            # Queremos que si FIRE está a la derecha (error>0) el dron
-            # se mueva a la derecha, por eso usamos el signo invertido.
-            tl_flight.rc(a=-control, b=0, c=0, d=0)
+            # Tello: left/right es el primer parámetro
+            # FIRE a derecha → mover a derecha → cmd positivo
+            drone.send_rc_control(cmd, 0, 0, 0)
 
-            prev_error = error_filtered
-            last_control = control
+            prev_error = error_f
+            last_cmd = cmd
 
-        prev_time = current_time
+        prev_time = now
         time.sleep(0.05)
 
-    # Parar siempre el rc al salir
-    tl_flight.rc(a=0, b=0, c=0, d=0)
+    drone.send_rc_control(0, 0, 0, 0)
 
-    # Cerrar la ventana de debug
-    try:
-        cv2.destroyWindow("FIRE debug")
-    except:
-        pass
-
-    # Si se centró FIRE, ejecutar la maniobra de bajar-guardar-subir
-    if centered and last_centroid is not None:
-        print(">>> FIRE centrado: bajando 20 cm...")
-        tl_flight.down(20).wait_for_completed()
-
-        print(">>> Manteniendo posición 5 segundos...")
+    if centered:
+        print(">>> FIRE centrado: BAJANDO 20 cm")
+        drone.move_down(20)
         time.sleep(5)
-
-        print(">>> Subiendo 20 cm...")
-        tl_flight.up(20).wait_for_completed()
-        print(">>> Maniobra FIRE completada.")
+        print(">>> SUBIENDO 20 cm")
+        drone.move_up(20)
+        print(">>> MANIOBRA FIRE COMPLETADA")
     else:
-        print("No se logró centrar FIRE dentro del tiempo límite; se continúa sin bajar/subir.")
+        print("No se centró dentro del tiempo límite.")
 
 
 # ============================================================
-# MAIN
+# PROGRAMA PRINCIPAL
 # ============================================================
-if __name__ == "__main__":
+drone.takeoff()
+time.sleep(2)
 
-    # Despegar
-    tl_flight.takeoff().wait_for_completed()
-    time.sleep(2)
+for i in range(len(wpX)):
 
-    for i in range(len(wpX)):
+    dx = wpX[i] - positionX
+    dy = wpY[i] - positionY
 
-        dx = wpX[i] - positionX
-        dy = wpY[i] - positionY
+    target_angle = np.degrees(np.arctan2(dy, dx))
+    turn_angle = target_angle - heading
+    turn_angle = -((turn_angle + 180) % 360 - 180)
+    turn_angle = int(turn_angle)
 
-        # Ángulo objetivo respecto al mundo
-        target_angle = np.rad2deg(np.arctan2(dy, dx))
+    distance = int(np.sqrt(dx ** 2 + dy ** 2) * 60)
 
-        # Ángulo respecto al heading actual
-        turn_angle = target_angle - heading
+    print(f"\n=== WAYPOINT {i+1} ===")
+    print(f"Target: ({wpX[i]},{wpY[i]})")
+    print(f"Giro:   {turn_angle}°")
+    print(f"Avance: {distance} cm")
 
-        # Normalizar a -180..180
-        turn_angle = -((turn_angle + 180) % 360 - 180)
+    # Girar
+    if abs(turn_angle) > 5:
+        if turn_angle > 0:
+            drone.rotate_clockwise(turn_angle)
+        else:
+            drone.rotate_counter_clockwise(-turn_angle)
 
-        turn_angle = int(turn_angle)
+    # Avanzar
+    drone.move_forward(distance)
+    print("Waypoint alcanzado")
 
-        # Distancia a recorrer (cada unidad de grid → 45 cm)
-        distance = int(np.sqrt(dx ** 2 + dy ** 2) * 45)
+    # Corrección FIRE
+    try:
+        center_fire_and_go_down_up()
+    except Exception as e:
+        print("Error durante corrección:", e)
 
-        print(f"Coordenada objetivo: ({wpX[i]}),({wpY[i]})")
-        print(f"Ángulo a girar:         {turn_angle}°")
-        print(f"Distancia a recorrer:   {distance} cm")
+    positionX = wpX[i]
+    positionY = wpY[i]
+    heading = target_angle
 
-        if abs(turn_angle) > 5:
-            tl_flight.rotate(angle=turn_angle).wait_for_completed()
-
-        tl_flight.forward(distance).wait_for_completed()
-        print("Waypoint alcanzado")
-        time.sleep(5)
-        print("-----")
-
-        # === Fase de corrección FIRE en cada waypoint ===
-        try:
-            center_fire_and_go_down_up()
-        except Exception as e:
-            print(f"Error en fase FIRE: {e}")
-
-        # Actualizar posición y orientación
-        positionX = wpX[i]
-        positionY = wpY[i]
-        heading = target_angle
-
-    # === Aterrizar ===
-    tl_flight.land().wait_for_completed()
-
-    # === Cerrar recursos ===
-    tl_drone.camera.stop_video_stream()
-    tl_drone.close()
+# Aterrizar
+drone.land()
+drone.streamoff()
