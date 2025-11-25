@@ -489,24 +489,108 @@ def correction_phase():
     in_correction_mode = False
 
 # ============================================================
-# RUTA DRON 1
+# DETECCIÓN DE FUEGO Y REGISTRO DE WAYPOINTS
+# ============================================================
+def fire_detection_segment(frame, segment_index, wpX, wpY, segment_seen, segment_seen_prev, 
+                           model, target_class="Fire", height_limit_ratio=0.4, verbose=True):
+    
+    # Detección de fuego
+    results = model(frame, conf=0.3, verbose=False)
+    
+    fire_centroid = None
+    fire_detected = False
+    
+    if results and len(results) > 0:
+        result = results[0]
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy().astype(int)
+            confs = result.boxes.conf.cpu().numpy()
+            names = result.names
+            
+            best_conf = 0
+            best_center = None
+            
+            for box, cls_id, cf in zip(boxes, classes, confs):
+                if names[cls_id].lower() == target_class.lower():
+                    x1, y1, x2, y2 = box
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+                    
+                    if cf > best_conf:
+                        best_conf = cf
+                        best_center = (cx, cy)
+            
+            if best_center is not None:
+                fire_centroid = best_center
+                fire_detected = True
+    
+    # Lógica de registro
+    limit_line = int(frame.shape[0] * height_limit_ratio)
+    
+    if fire_detected and not segment_seen:
+        cx, cy = fire_centroid
+        
+        if segment_seen_prev:
+            # Validar que esté suficientemente arriba para no ser el mismo fuego
+            if cy < limit_line:
+                wpX.append(segment_index)
+                wpY.append(0)
+                segment_seen = True
+                if verbose:
+                    print(f"    🔥 Fuego registrado en segmento {segment_index}")
+            else:
+                if verbose:
+                    print(f"    ⚠️ Fuego ignorado en segmento {segment_index} (misma fuente visual)")
+        else:
+            # El segmento anterior no tenía fuego → registrar normal
+            wpX.append(segment_index)
+            wpY.append(0)
+            segment_seen = True
+            if verbose:
+                print(f"    🔥 Fuego registrado en segmento {segment_index}")
+    
+    return fire_detected, segment_seen, fire_centroid
+
+# ============================================================
+# RUTA DRON 1 CON DETECCIÓN DE FUEGO
 # ============================================================
 def ruta():
-    global segment_counter
+    global segment_counter, segment_seen, segment_seen_prev
+    
     for i in range(2):
         print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
         
         for j in range(5):
-            if j == 5:
-                move_forward_safe()
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-            else:
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-                move_forward_safe()
+            segment_counter += 1
+            print(f"\nSeg {segment_counter}")
+            
+            # AVANZAR
+            move_forward_safe()
+            
+            # ========== DETECCIÓN DE FUEGO ==========
+            frame = frame_read.frame
+            if frame is not None:
+                frame_bgr = transform_frame(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                 
-                # Esperar y verificar detección durante 2.5 segundos
+                # Detectar fuego en este segmento
+                fire_detected, segment_seen, fire_centroid = fire_detection_segment(
+                    frame=frame_bgr,
+                    segment_index=segment_counter,
+                    wpX=wpX,
+                    wpY=wpY,
+                    segment_seen=segment_seen,
+                    segment_seen_prev=segment_seen_prev,
+                    model=model,
+                    target_class=FIRE_TARGET_CLASS,
+                    height_limit_ratio=FIRE_HEIGHT_LIMIT,
+                    verbose=True
+                )
+            else:
+                fire_detected = False
+            
+            # ========== DETECCIÓN Y CORRECCIÓN DE PIPES ==========
+            if j < 4:  # Solo en los primeros 4 segmentos (no en el último)
                 print(f"    🔍 Buscando pipes (2.5s)...")
                 detection_start = time.time()
                 detection_duration = 2.5
@@ -536,21 +620,44 @@ def ruta():
                         correction_phase()
                 else:
                     print(f"    ⚠️ Error en detección - Solo avance")
+            
+            # Actualizar banderas para siguiente segmento
+            segment_seen_prev = segment_seen
+            segment_seen = False
         
         print("Pipe LARGO OK")
         rotate_left_90()
 
         for j in range(6):
-            if j == 6:
-                move_forward_safe()
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-            else:
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-                move_forward_safe()
+            segment_counter += 1
+            print(f"\nSeg {segment_counter}")
+            
+            # AVANZAR
+            move_forward_safe()
+            
+            # ========== DETECCIÓN DE FUEGO ==========
+            frame = frame_read.frame
+            if frame is not None:
+                frame_bgr = transform_frame(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                 
-                # Esperar y verificar detección durante 2.5 segundos
+                # Detectar fuego en este segmento
+                fire_detected, segment_seen, fire_centroid = fire_detection_segment(
+                    frame=frame_bgr,
+                    segment_index=segment_counter,
+                    wpX=wpX,
+                    wpY=wpY,
+                    segment_seen=segment_seen,
+                    segment_seen_prev=segment_seen_prev,
+                    model=model,
+                    target_class=FIRE_TARGET_CLASS,
+                    height_limit_ratio=FIRE_HEIGHT_LIMIT,
+                    verbose=True
+                )
+            else:
+                fire_detected = False
+            
+            # ========== DETECCIÓN Y CORRECCIÓN DE PIPES ==========
+            if j < 5:  # Solo en los primeros 5 segmentos (no en el último)
                 print(f"    🔍 Buscando pipes (2.5s)...")
                 detection_start = time.time()
                 detection_duration = 2.5
@@ -580,21 +687,66 @@ def ruta():
                         correction_phase()
                 else:
                     print(f"    ⚠️ Error en detección - Solo avance")
+            
+            # Actualizar banderas para siguiente segmento
+            segment_seen_prev = segment_seen
+            segment_seen = False
         
-        move_forward_safe()
+        # Último segmento adicional (después del loop de 6)
         segment_counter += 1
         print(f"\nSeg {segment_counter}")
+        move_forward_safe()
+        
+        # Detección de fuego en el último segmento
+        frame = frame_read.frame
+        if frame is not None:
+            frame_bgr = transform_frame(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            fire_detected, segment_seen, fire_centroid = fire_detection_segment(
+                frame=frame_bgr,
+                segment_index=segment_counter,
+                wpX=wpX,
+                wpY=wpY,
+                segment_seen=segment_seen,
+                segment_seen_prev=segment_seen_prev,
+                model=model,
+                target_class=FIRE_TARGET_CLASS,
+                height_limit_ratio=FIRE_HEIGHT_LIMIT,
+                verbose=True
+            )
+        
         time.sleep(3.0)
+        
+        # Actualizar banderas
+        segment_seen_prev = segment_seen
+        segment_seen = False
 
         print("Pipe CORTO OK")
         rotate_left_90()
     
     print("\n✅ COMPLETADO")
+    
+    # Mostrar waypoints registrados
+    print("\n===== WAYPOINTS DE FUEGO REGISTRADOS =====")
+    print(f"Segmentos con fuego: {wpX}")
+    print(f"Posiciones Y: {wpY}")
+    print(f"Total de fuegos detectados: {len(wpX)}")
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
+    # Listas de waypoints
+    wpX = []
+    wpY = []
+
+    # Banderas para detección de fuego
+    segment_seen = False
+    segment_seen_prev = False
+
+    # Configuración de detección de fuego
+    FIRE_TARGET_CLASS = "Fire"  # o "Pipes" según tu modelo
+    FIRE_HEIGHT_LIMIT = 0.4
+
     try:
         time.sleep(3)
         input("Presiona ENTER para despegar...")
@@ -607,6 +759,7 @@ if __name__ == "__main__":
         print("✓ Listo para iniciar")
 
         print("Iniciando Ruta.......")
+        move_forward_safe()
         ruta()
 
     except KeyboardInterrupt:
