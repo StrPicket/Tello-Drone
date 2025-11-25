@@ -35,7 +35,7 @@ DEBUG_DETECTIONS = True
 ENABLE_VISUALIZATION = True  # ← NUEVO: False para desactivar ventana
 
 # ============================================================
-# SETUP
+# SETUP INICIAL
 # ============================================================
 print("Conectando...")
 tello = Tello()
@@ -241,6 +241,9 @@ def continuous_detection_thread():
 detection_thread_obj = threading.Thread(target=continuous_detection_thread, daemon=True)
 detection_thread_obj.start()
 
+# ============================================================
+# CALIBRACION DEL SENSOR
+# ============================================================
 def sensor_calibration():
     """Calibración de sensores del drone"""
     print("    → Estabilizando sensores...")
@@ -258,7 +261,6 @@ def move_forward_safe():
     in_correction_mode = False
     try:
         tello.move_forward(60)
-        print(f"    ✓ Avance completo")
         time.sleep(STABILIZATION_TIME)
     except Exception as e:
         print(f"    ✗ Error: {e}")
@@ -270,11 +272,13 @@ def rotate_left_90():
     in_correction_mode = False
     try:
         tello.rotate_counter_clockwise(90)
-        print(f"    ✓ Rotación completa")
         time.sleep(1.0)
     except Exception as e:
         print(f"    ✗ Error: {e}")
 
+# ============================================================
+# CANTIDAD DE PIPES EN ROI
+# ============================================================
 def count_pipes_in_roi(samples=5, verbose=False):
     """
     Cuenta cuántos pipes están dentro del ROI
@@ -485,18 +489,114 @@ def correction_phase():
     in_correction_mode = False
 
 # ============================================================
+# RUTA DRON 1
+# ============================================================
+def ruta():
+    global segment_counter
+    for i in range(2):
+        print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
+        
+        for j in range(5):
+            if j == 5:
+                move_forward_safe()
+                segment_counter += 1
+                print(f"\nSeg {segment_counter}")
+            else:
+                segment_counter += 1
+                print(f"\nSeg {segment_counter}")
+                move_forward_safe()
+                
+                # Esperar y verificar detección durante 2.5 segundos
+                print(f"    🔍 Buscando pipes (2.5s)...")
+                detection_start = time.time()
+                detection_duration = 2.5
+                detection_samples = []
+
+                while time.time() - detection_start < detection_duration:
+                    pipes_count = count_pipes_in_roi(samples=3, verbose=False)
+                    detection_samples.append(pipes_count)
+                    print(f"      ⏱️ {time.time() - detection_start:.1f}s: {pipes_count} pipes")
+                    time.sleep(0.3)
+
+                # Analizar resultados: usar el valor más común
+                if detection_samples:
+                    counter = Counter(detection_samples)
+                    pipes_detected = counter.most_common(1)[0][0]
+                    detection_rate = detection_samples.count(pipes_detected) / len(detection_samples) * 100
+                    
+                    print(f"    📊 Pipes detectados: {pipes_detected} (confianza: {detection_rate:.0f}%)")
+                    print(f"    📈 Muestras: {detection_samples}")
+                    
+                    if pipes_detected == 0:
+                        print(f"    ⚠️ Sin pipes - Solo avance")
+                    elif pipes_detected > 2:
+                        print(f"    ⚠️ Demasiados pipes - Solo avance")
+                    else:
+                        print(f"    ✓ Ejecutando corrección")
+                        correction_phase()
+                else:
+                    print(f"    ⚠️ Error en detección - Solo avance")
+        
+        print("Pipe LARGO OK")
+        rotate_left_90()
+
+        for j in range(6):
+            if j == 6:
+                move_forward_safe()
+                segment_counter += 1
+                print(f"\nSeg {segment_counter}")
+            else:
+                segment_counter += 1
+                print(f"\nSeg {segment_counter}")
+                move_forward_safe()
+                
+                # Esperar y verificar detección durante 2.5 segundos
+                print(f"    🔍 Buscando pipes (2.5s)...")
+                detection_start = time.time()
+                detection_duration = 2.5
+                detection_samples = []
+
+                while time.time() - detection_start < detection_duration:
+                    pipes_count = count_pipes_in_roi(samples=3, verbose=False)
+                    detection_samples.append(pipes_count)
+                    print(f"      ⏱️ {time.time() - detection_start:.1f}s: {pipes_count} pipes")
+                    time.sleep(0.3)
+
+                # Analizar resultados: usar el valor más común
+                if detection_samples:
+                    counter = Counter(detection_samples)
+                    pipes_detected = counter.most_common(1)[0][0]
+                    detection_rate = detection_samples.count(pipes_detected) / len(detection_samples) * 100
+                    
+                    print(f"    📊 Pipes detectados: {pipes_detected} (confianza: {detection_rate:.0f}%)")
+                    print(f"    📈 Muestras: {detection_samples}")
+                    
+                    if pipes_detected == 0:
+                        print(f"    ⚠️ Sin pipes - Solo avance")
+                    elif pipes_detected > 2:
+                        print(f"    ⚠️ Demasiados pipes - Solo avance")
+                    else:
+                        print(f"    ✓ Ejecutando corrección")
+                        correction_phase()
+                else:
+                    print(f"    ⚠️ Error en detección - Solo avance")
+        
+        move_forward_safe()
+        segment_counter += 1
+        print(f"\nSeg {segment_counter}")
+        time.sleep(3.0)
+
+        print("Pipe CORTO OK")
+        rotate_left_90()
+    
+    print("\n✅ COMPLETADO")
+
+# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
     try:
-        print("\n=== CONFIGURACIÓN ===")
-        print(f"Cam: {CAMERA_TRANSFORM}")
-        print(f"ROI: {ROI_LEFT_LIMIT} < x < {ROI_RIGHT_LIMIT}")
-        print(f"Tiempo corrección: {CORRECTION_TIME}s")
-        print(f"Inferencia: {INFERENCE_SIZE}px (corrección) / {INFERENCE_SIZE_LIGHT}px (navegación)")
-        print(f"Visualización: {'Activada' if ENABLE_VISUALIZATION else 'Desactivada'}")
         time.sleep(3)
-        
         input("Presiona ENTER para despegar...")
         
         print("\n=== DESPEGUE ===")
@@ -505,105 +605,10 @@ if __name__ == "__main__":
         print("⏳ Esperando 3s...")
         time.sleep(3)
         print("✓ Listo para iniciar")
-        
-        for i in range(2):
-            print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
-            
-            for j in range(5):
-                if j == 5:
-                    move_forward_safe()
-                    segment_counter += 1
-                    print(f"\nSeg {segment_counter}")
-                else:
-                    segment_counter += 1
-                    print(f"\nSeg {segment_counter}")
-                    move_forward_safe()
-                    
-                    # Esperar y verificar detección durante 2.5 segundos
-                    print(f"    🔍 Buscando pipes (2.5s)...")
-                    detection_start = time.time()
-                    detection_duration = 2.5
-                    detection_samples = []
 
-                    while time.time() - detection_start < detection_duration:
-                        pipes_count = count_pipes_in_roi(samples=3, verbose=False)
-                        detection_samples.append(pipes_count)
-                        print(f"      ⏱️ {time.time() - detection_start:.1f}s: {pipes_count} pipes")
-                        time.sleep(0.3)
+        print("Iniciando Ruta.......")
+        ruta()
 
-                    # Analizar resultados: usar el valor más común
-                    if detection_samples:
-                        counter = Counter(detection_samples)
-                        pipes_detected = counter.most_common(1)[0][0]
-                        detection_rate = detection_samples.count(pipes_detected) / len(detection_samples) * 100
-                        
-                        print(f"    📊 Pipes detectados: {pipes_detected} (confianza: {detection_rate:.0f}%)")
-                        print(f"    📈 Muestras: {detection_samples}")
-                        
-                        if pipes_detected == 0:
-                            print(f"    ⚠️ Sin pipes - Solo avance")
-                        elif pipes_detected > 2:
-                            print(f"    ⚠️ Demasiados pipes - Solo avance")
-                        else:
-                            print(f"    ✓ Ejecutando corrección")
-                            correction_phase()
-                    else:
-                        print(f"    ⚠️ Error en detección - Solo avance")
-            
-            print("Pipe LARGO OK")
-            rotate_left_90()
-
-            for j in range(6):
-                if j == 6:
-                    move_forward_safe()
-                    segment_counter += 1
-                    print(f"\nSeg {segment_counter}")
-                else:
-                    segment_counter += 1
-                    print(f"\nSeg {segment_counter}")
-                    move_forward_safe()
-                    
-                    # Esperar y verificar detección durante 2.5 segundos
-                    print(f"    🔍 Buscando pipes (2.5s)...")
-                    detection_start = time.time()
-                    detection_duration = 2.5
-                    detection_samples = []
-
-                    while time.time() - detection_start < detection_duration:
-                        pipes_count = count_pipes_in_roi(samples=3, verbose=False)
-                        detection_samples.append(pipes_count)
-                        print(f"      ⏱️ {time.time() - detection_start:.1f}s: {pipes_count} pipes")
-                        time.sleep(0.3)
-
-                    # Analizar resultados: usar el valor más común
-                    if detection_samples:
-                        counter = Counter(detection_samples)
-                        pipes_detected = counter.most_common(1)[0][0]
-                        detection_rate = detection_samples.count(pipes_detected) / len(detection_samples) * 100
-                        
-                        print(f"    📊 Pipes detectados: {pipes_detected} (confianza: {detection_rate:.0f}%)")
-                        print(f"    📈 Muestras: {detection_samples}")
-                        
-                        if pipes_detected == 0:
-                            print(f"    ⚠️ Sin pipes - Solo avance")
-                        elif pipes_detected > 2:
-                            print(f"    ⚠️ Demasiados pipes - Solo avance")
-                        else:
-                            print(f"    ✓ Ejecutando corrección")
-                            correction_phase()
-                    else:
-                        print(f"    ⚠️ Error en detección - Solo avance")
-            
-            move_forward_safe()
-            segment_counter += 1
-            print(f"\nSeg {segment_counter}")
-            time.sleep(3.0)
-
-            print("Pipe CORTO OK")
-            rotate_left_90()
-        
-        print("\n✅ COMPLETADO")
-        
     except KeyboardInterrupt:
         print("\n⚠️ Interrumpido")
     except Exception as e:
