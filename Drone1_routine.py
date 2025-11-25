@@ -510,7 +510,7 @@ if __name__ == "__main__":
             print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
             
             for j in range(5):
-                if j == 6:
+                if j == 5:
                     move_forward_safe()
                     segment_counter += 1
                     print(f"\nSeg {segment_counter}")

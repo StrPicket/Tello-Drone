@@ -37,3 +37,33 @@ if __name__ == '__main__':
 
     # Aterrizar
     tl_drone.land()
+
+
+
+
+
+
+            # RUTA
+        for i in range(2):
+            print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
+            
+            for j in range(5):
+                segment_counter += 1
+                print(f"\nSegmento {segment_counter}")
+                move_forward_safe()
+                correction_phase()
+
+            
+            print("Pipe LARGO completado")
+            rotate_left_90()
+            
+            for k in range(5):
+                segment_counter += 1
+                print(f"\nSegmento {segment_counter}")
+                move_forward_safe()
+                correction_phase()
+
+            print("Pipe CORTO completado")
+            rotate_left_90()
+        
+        print("\n✅ COMPLETADO")
