@@ -4,7 +4,7 @@ from djitellopy import Tello
 from ultralytics import YOLO
 import time
 import threading
-from collections import deque
+from collections import deque, Counter
 
 # ============================================================
 # CONFIGURACIÓN
@@ -25,10 +25,12 @@ FRAME_SKIP = 2
 CAMERA_TRANSFORM = "flip_v"
 
 # ========== ROI AMPLIADO ==========
-ROI_LEFT_LIMIT = 280      # ← Mucho más a la derecha
+ROI_LEFT_LIMIT = 80     # ← Mucho más a la derecha
 ROI_TOP_LIMIT = 0
 ROI_BOTTOM_LIMIT = 480
-ROI_RIGHT_LIMIT = 640     # ← Rango completo (sin límite derecho)
+ROI_RIGHT_LIMIT = 880    # ← Rango completo (sin límite derecho)
+
+DEBUG_DETECTIONS = True   # ← NUEVO: Para ver qué detecta
 
 # ============================================================
 # SETUP
@@ -198,6 +200,15 @@ def continuous_detection_thread():
 detection_thread_obj = threading.Thread(target=continuous_detection_thread, daemon=True)
 detection_thread_obj.start()
 
+def sensor_calibration():
+    """Calibración de sensores del drone"""
+    print("    → Estabilizando sensores...")
+    time.sleep(2)
+    # Pequeños movimientos para calibrar
+    tello.send_rc_control(0, 0, 0, 0)
+    time.sleep(0.5)
+    print("    ✓ Calibración completa")
+
 # ============================================================
 # FUNCIONES DE NAVEGACIÓN
 # ============================================================
@@ -224,6 +235,72 @@ def rotate_left_90():
     except Exception as e:
         print(f"    ✗ Error: {e}")
 
+def count_pipes_in_roi(samples=5, verbose=False):
+    """
+    Cuenta cuántos pipes están dentro del ROI
+    Toma múltiples muestras y devuelve el valor más común
+    """
+    global frame_counter
+    
+    detections = []
+    
+    for sample in range(samples):
+        frame = frame_read.frame
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        
+        frame_bgr = transform_frame(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        h, w = frame_bgr.shape[:2]
+        
+        results = model(frame_bgr, conf=0.3, verbose=False, imgsz=INFERENCE_SIZE)
+        
+        pipes_in_roi = 0
+        
+        if len(results) > 0 and results[0].masks is not None:
+            result = results[0]
+            classes = result.boxes.cls.cpu().numpy().astype(int)
+            class_names = result.names
+            
+            for i, cls_id in enumerate(classes):
+                class_name = class_names[cls_id]
+                
+                # Aceptar pipes y fire
+                if class_name.lower() in ['pipes', 'pipe', 'fire']:
+                    mask = result.masks.data[i].cpu().numpy()
+                    mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+                    mask_bin = (mask_resized > 0.5).astype(np.uint8)
+                    
+                    M = cv2.moments(mask_bin)
+                    if M["m00"] > 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        
+                        in_roi = (cx >= ROI_LEFT_LIMIT and 
+                                 cx <= ROI_RIGHT_LIMIT and
+                                 cy >= ROI_TOP_LIMIT and 
+                                 cy <= ROI_BOTTOM_LIMIT)
+                        
+                        if in_roi:
+                            pipes_in_roi += 1
+        
+        detections.append(pipes_in_roi)
+        
+        if verbose and sample < samples - 1:
+            print(f"      Muestra {sample+1}/{samples}: {pipes_in_roi} pipes")
+        
+        time.sleep(0.1)
+    
+    # Devolver el valor más común
+    if detections:
+        counter = Counter(detections)
+        most_common = counter.most_common(1)[0][0]
+        if verbose:
+            print(f"      → Detecciones: {detections} → Más común: {most_common}")
+        return most_common
+    
+    return 0
+
 # ============================================================
 # CORRECCIÓN OPTIMIZADA CON FEEDBACK
 # ============================================================
@@ -235,11 +312,12 @@ def correction_phase():
     prev_time = time.time()
     start_time = time.time()
     
-    print(f"    → Control PD ({CORRECTION_TIME}s) [ROI: x>{ROI_LEFT_LIMIT}]")
+    print(f"    → Control PD ({CORRECTION_TIME}s) [ROI: {ROI_LEFT_LIMIT}<x<{ROI_RIGHT_LIMIT}]")
     
     error_buffer = deque(maxlen=4)
     last_control = 0
     corrections_made = 0
+    no_detection_count = 0  # ← NUEVO contador
     
     while time.time() - start_time < CORRECTION_TIME:
         frame = frame_read.frame
@@ -263,6 +341,15 @@ def correction_phase():
         
         pipe_found = False
         
+        # ========== DEBUG: MOSTRAR TODAS LAS DETECCIONES ==========
+        if DEBUG_DETECTIONS and len(results) > 0 and results[0].boxes is not None:
+            result = results[0]
+            classes = result.boxes.cls.cpu().numpy().astype(int)
+            class_names = result.names
+            detected_classes = [class_names[c] for c in classes]
+            if detected_classes:
+                print(f"      DEBUG: Detectadas clases: {set(detected_classes)}")
+        
         if len(results) > 0 and results[0].masks is not None:
             result = results[0]
             classes = result.boxes.cls.cpu().numpy().astype(int)
@@ -270,9 +357,14 @@ def correction_phase():
             
             best_pipe_idx = None
             best_conf = 0
+            candidates_info = []  # ← NUEVO: para debug
             
             for i, cls_id in enumerate(classes):
-                if class_names[cls_id].lower() == TARGET_CLASS.lower():
+                class_name = class_names[cls_id]
+                
+                # ========== ACEPTAR PIPES Y FIRE ==========
+                # Cambia según lo que detecte tu modelo
+                if class_name.lower() in ['pipes', 'pipe', 'fire']:  # ← MODIFICADO
                     mask = result.masks.data[i].cpu().numpy()
                     mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
                     mask_bin = (mask_resized > 0.5).astype(np.uint8)
@@ -287,12 +379,21 @@ def correction_phase():
                                  cy >= ROI_TOP_LIMIT and 
                                  cy <= ROI_BOTTOM_LIMIT)
                         
-                        if in_roi and result.boxes.conf[i] > best_conf:
+                        conf = result.boxes.conf[i].item()
+                        candidates_info.append(f"{class_name}@({cx},{cy}) ROI:{in_roi} conf:{conf:.2f}")
+                        
+                        if in_roi and conf > best_conf:
                             best_pipe_idx = i
-                            best_conf = result.boxes.conf[i]
+                            best_conf = conf
+            
+            # ========== DEBUG: MOSTRAR CANDIDATOS ==========
+            if DEBUG_DETECTIONS and candidates_info:
+                print(f"      Candidatos: {' | '.join(candidates_info)}")
             
             if best_pipe_idx is not None:
                 pipe_found = True
+                no_detection_count = 0
+                
                 mask = result.masks.data[best_pipe_idx].cpu().numpy()
                 mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
                 mask_bin = (mask_resized > 0.5).astype(np.uint8)
@@ -312,7 +413,6 @@ def correction_phase():
                         d_term = KD * (error_filtered - prev_error) / dt
                         control = p_term + d_term
                         
-                        # Suavizar cambios bruscos
                         control_change = abs(control - last_control)
                         if control_change > 10:
                             control = last_control + np.sign(control - last_control) * 10
@@ -326,10 +426,13 @@ def correction_phase():
                     
                     # Feedback cada 2 segundos
                     if int(time.time() - start_time) % 2 == 0 and corrections_made > 0:
-                        print(f"      error:{error_filtered:4d} | ctrl:{control:3d}")
+                        print(f"      ✓ error:{error_filtered:4d} | ctrl:{control:3d}")
                         corrections_made = 0
         
         if not pipe_found:
+            no_detection_count += 1
+            if DEBUG_DETECTIONS and no_detection_count % 20 == 0:
+                print(f"      ⚠ Sin detección válida en ROI ({no_detection_count} frames)")
             tello.send_rc_control(0, 0, 0, 0)
             error_buffer.clear()
         
@@ -347,7 +450,7 @@ if __name__ == "__main__":
     try:
         print("\n=== CONFIGURACIÓN ===")
         print(f"Cam: {CAMERA_TRANSFORM}")
-        print(f"ROI: x > {ROI_LEFT_LIMIT} (hasta x={ROI_RIGHT_LIMIT})")
+        print(f"ROI: x > {ROI_LEFT_LIMIT}")
         print(f"Tiempo corrección: {CORRECTION_TIME}s")
         time.sleep(3)
         
@@ -355,59 +458,104 @@ if __name__ == "__main__":
         
         print("\n=== DESPEGUE ===")
         tello.takeoff()
+        
+        # SOLO ESPERA PASIVA - SIN COMANDOS
+        print("⏳ Esperando 3s...")
         time.sleep(3)
+        print("✓ Listo para iniciar")
         
-        print("🔺 Subiendo 30cm...")
-        tello.move_up(30)
-        time.sleep(2)
-        
-        print("Auto-calibración 4s...")
-        time.sleep(4)
-        
-        # RUTA
         for i in range(2):
             print(f"\n{'='*50}\nVUELTA {i+1}/2\n{'='*50}")
             
-            # 5 segmentos normales
-            for j in range(5):
-                if j == 4 : # Segmento final antes de rotar
+            for j in range(6):
+                if j == 5:
                     move_forward_safe()
                     segment_counter += 1
                     print(f"\nSeg {segment_counter}")
-
                 else:
                     segment_counter += 1
                     print(f"\nSeg {segment_counter}")
                     move_forward_safe()
-                    correction_phase()
+                    
+                    # Esperar y verificar detección durante 2.5 segundos
+                    print(f"    🔍 Buscando pipes (2.5s)...")
+                    detection_start = time.time()
+                    detection_duration = 2.5
+                    detection_samples = []
+
+                    while time.time() - detection_start < detection_duration:
+                        pipes_count = count_pipes_in_roi(samples=3, verbose=False)
+                        detection_samples.append(pipes_count)
+                        print(f"      ⏱️ {time.time() - detection_start:.1f}s: {pipes_count} pipes")
+                        time.sleep(0.3)
+
+                    # Analizar resultados: usar el valor más común
+                    if detection_samples:
+                        counter = Counter(detection_samples)
+                        pipes_detected = counter.most_common(1)[0][0]
+                        detection_rate = detection_samples.count(pipes_detected) / len(detection_samples) * 100
+                        
+                        print(f"    📊 Pipes detectados: {pipes_detected} (confianza: {detection_rate:.0f}%)")
+                        print(f"    📈 Muestras: {detection_samples}")
+                        
+                        if pipes_detected == 0:
+                            print(f"    ⚠️ Sin pipes - Solo avance")
+                        elif pipes_detected > 2:
+                            print(f"    ⚠️ Demasiados pipes - Solo avance")
+                        else:
+                            print(f"    ✓ Ejecutando corrección")
+                            correction_phase()
+                    else:
+                        print(f"    ⚠️ Error en detección - Solo avance")
             
             print("Pipe LARGO OK")
             rotate_left_90()
+
+            for j in range(6):
+                if j == 5:
+                    move_forward_safe()
+                    segment_counter += 1
+                    print(f"\nSeg {segment_counter}")
+                else:
+                    segment_counter += 1
+                    print(f"\nSeg {segment_counter}")
+                    move_forward_safe()
+                    
+                    # Esperar y verificar detección durante 2.5 segundos
+                    print(f"    🔍 Buscando pipes (2.5s)...")
+                    detection_start = time.time()
+                    detection_duration = 2.5
+                    detection_samples = []
+
+                    while time.time() - detection_start < detection_duration:
+                        pipes_count = count_pipes_in_roi(samples=3, verbose=False)
+                        detection_samples.append(pipes_count)
+                        print(f"      ⏱️ {time.time() - detection_start:.1f}s: {pipes_count} pipes")
+                        time.sleep(0.3)
+
+                    # Analizar resultados: usar el valor más común
+                    if detection_samples:
+                        counter = Counter(detection_samples)
+                        pipes_detected = counter.most_common(1)[0][0]
+                        detection_rate = detection_samples.count(pipes_detected) / len(detection_samples) * 100
+                        
+                        print(f"    📊 Pipes detectados: {pipes_detected} (confianza: {detection_rate:.0f}%)")
+                        print(f"    📈 Muestras: {detection_samples}")
+                        
+                        if pipes_detected == 0:
+                            print(f"    ⚠️ Sin pipes - Solo avance")
+                        elif pipes_detected > 2:
+                            print(f"    ⚠️ Demasiados pipes - Solo avance")
+                        else:
+                            print(f"    ✓ Ejecutando corrección")
+                            correction_phase()
+                    else:
+                        print(f"    ⚠️ Error en detección - Solo avance")
             
-            # 2 segmentos
-            for k in range(2):
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-                move_forward_safe()
-                correction_phase()
-            
-            # Pausa
             move_forward_safe()
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
             time.sleep(3.0)
-
-            # 2 segmentos más
-            for k in range(2):
-                segment_counter += 1
-                print(f"\nSeg {segment_counter}")
-                move_forward_safe()
-                correction_phase()
-            
-            # Segmento final
-            move_forward_safe()
-            segment_counter += 1
-            print(f"\nSeg {segment_counter}")
 
             print("Pipe CORTO OK")
             rotate_left_90()
@@ -415,7 +563,7 @@ if __name__ == "__main__":
         print("\n✅ COMPLETADO")
         
     except KeyboardInterrupt:
-        print("\n⚠️ Interrumpido por usuario")
+        print("\n⚠️ Interrumpido")
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback
