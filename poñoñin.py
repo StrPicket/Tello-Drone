@@ -1,4 +1,6 @@
-
+# ============================================================
+# P O Ñ O Ñ I N   V O L A D  O R
+# ============================================================
 import cv2
 import numpy as np
 from djitellopy import Tello
@@ -407,7 +409,7 @@ def run_route():
             start = time.time()
 
             while(time.time() - start) < 2.5:
-                _, segment_seen = detect_fie(segment_counter, segment_seen)
+                _, segment_seen = detect_fire(segment_counter, segment_seen)
             
             if j < 5:  # Corrección excepto último segmento
                 pipes = count_pipes(samples=5)
@@ -426,7 +428,7 @@ def run_route():
             start = time.time()
             
             while(time.time() - start) < 2.5:
-                _, segment_seen = detect_fie(segment_counter, segment_seen)
+                _, segment_seen = detect_fire(segment_counter, segment_seen)
             
             if j < 6:  # Corrección excepto último segmento
                 pipes = count_pipes(samples=5)
@@ -461,7 +463,7 @@ def run_route():
         writer = csv.writer(f)
         writer.writerow(["wpX","wpY"])
         for x,y in zip(wpX, wpY):
-            writer.writerow([x,Y])
+            writer.writerow([x,y])
     
     print("Archivo waypoints.csv guardado correctamente. ")
 
