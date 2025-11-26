@@ -32,7 +32,7 @@ ROI_BOTTOM = 480
 DEBUG_DETECTIONS = False  # Cambiar a True para ver más info
 
 # Límite vertical para evitar repetición de fuego
-HEIGHT_LIMIT_RATIO = 0.7   # 70% desde arriba de la imagen
+HEIGHT_LIMIT_RATIO = 0.5   # 50% desde arriba de la imagen
 
 # ============================================================
 # SETUP
@@ -481,8 +481,9 @@ def run_route():
                     correction_phase()
         
         rotate_left()
-
-    for i in wp:
+        
+    wp_unique = list(dict.fromkeys(wp))
+    for i in wp_unique:
         if i <= 6:
             wpX.append(i)
             wpY.append(0)
