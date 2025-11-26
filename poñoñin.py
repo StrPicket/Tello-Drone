@@ -32,7 +32,7 @@ ROI_BOTTOM = 480
 DEBUG_DETECTIONS = False  # Cambiar a True para ver más info
 
 # Límite vertical para evitar repetición de fuego
-HEIGHT_LIMIT_RATIO = 0.5   # 50% desde arriba de la imagen
+HEIGHT_LIMIT_RATIO = 0.15   # 50% desde arriba de la imagen
 
 # ============================================================
 # SETUP
@@ -272,7 +272,7 @@ def correction_phase():
         current_time = time.time()
         dt = max(current_time - prev_time, 0.001)
         
-        results = model(frame, conf=0.3, verbose=False, imgsz=INFERENCE_SIZE)
+        results = model(frame, conf=0.5, verbose=False, imgsz=INFERENCE_SIZE)
         
         pipe_found = False
         
@@ -381,7 +381,7 @@ def detect_fire(segment_idx, segment_seen_prev):
     h, w = frame.shape[:2]
     limit_line = int(h * HEIGHT_LIMIT_RATIO)
     
-    results = model(frame, conf=0.4, verbose=False, imgsz=160)
+    results = model(frame, conf=0.5, verbose=False)
     
     fire_detected = False
     
@@ -440,14 +440,13 @@ def run_route():
         
         # Lado largo (6 segmentos)
         for j in range(6):
-            segment_seen = False
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
             
             move_and_stabilize()
             start = time.time()
 
-            while (time.time() - start) < 2.5 or segment_seen == False:
+            while (time.time() - start) < 2.5:
                 segment_seen = detect_fire(segment_counter, segment_seen_prev)
             
             if j < 5:  # Corrección excepto último segmento
@@ -462,14 +461,13 @@ def run_route():
         
         # Lado corto (7 segmentos)
         for j in range(7):
-            segment_seen = False
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
             
             move_and_stabilize()
             start = time.time()
             
-            while (time.time() - start) < 2.5 or segment_seen == False:
+            while (time.time() - start) < 2.5:
                 segment_seen = detect_fire(segment_counter, segment_seen_prev)
 
             segment_seen_prev = False if j == 0 else segment_seen
@@ -537,4 +535,4 @@ if __name__ == "__main__":
         tello.streamoff()
         cv2.destroyAllWindows()
 
-        print("p")
+        print("poñoñin uwu")
