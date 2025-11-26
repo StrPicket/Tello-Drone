@@ -22,8 +22,8 @@ CORRECTION_TIME = 5.0
 INFERENCE_SIZE = 224
 
 # ROI para pipes
-ROI_LEFT = 80
-ROI_RIGHT = 900
+ROI_LEFT = 120
+ROI_RIGHT = 1000
 ROI_TOP = 0
 ROI_BOTTOM = 480
 
@@ -489,4 +489,4 @@ if __name__ == "__main__":
         tello.land()
         tello.streamoff()
         cv2.destroyAllWindows()
-        print("poñoñin yolo1")
+        print("poñoñin yolo-prefinal")
