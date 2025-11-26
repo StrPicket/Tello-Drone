@@ -20,19 +20,25 @@ DEADZONE = 60
 MAX_SPEED = 18
 CORRECTION_TIME = 5.0
 INFERENCE_SIZE = 224
-INFERENCE_SIZE_LIGHT = 160
 
-# ROI
+# ROI para pipes
 ROI_LEFT = 80
 ROI_RIGHT = 900
 ROI_TOP = 0
 ROI_BOTTOM = 480
 
-# Debug (opcional)
-DEBUG_DETECTIONS = False  # Cambiar a True para ver más info
+# ROI exclusivo para fuegos
+FIRE_ROI_LEFT = 300
+FIRE_ROI_RIGHT = 680
 
-# Límite vertical para evitar repetición de fuego
-HEIGHT_LIMIT_RATIO = 0.15   # 50% desde arriba de la imagen
+# Límite vertical
+HEIGHT_LIMIT_RATIO = 0.15
+
+# Colores BGR
+COLORS = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+    (255, 0, 255), (0, 255, 255), (128, 0, 128), (255, 128, 0)
+]
 
 # ============================================================
 # SETUP
@@ -49,143 +55,139 @@ model = YOLO(MODEL_PATH)
 frame_read = tello.get_frame_read()
 
 # Variables globales
-latest_frame = None
-cached_frame = None
-cached_frame_time = 0
-CACHE_DURATION = 0.05  # Cache de 50ms para evitar lecturas redundantes
-
 display_running = True
 in_correction_mode = False
 segment_counter = 0
-wp= []
+wp = []
 wpX = []
 wpY = []
 
 # ============================================================
 # FUNCIONES AUXILIARES
 # ============================================================
-def get_frame(use_cache=True):
-    """Obtiene y transforma el frame actual con cache opcional"""
-    global cached_frame, cached_frame_time
-    
-    current_time = time.time()
-    
-    # Usar cache si es reciente
-    if use_cache and cached_frame is not None and (current_time - cached_frame_time) < CACHE_DURATION:
-        return cached_frame
-    
-    # Leer nuevo frame
+def get_frame():
+    """Obtiene frame con flip vertical"""
     frame = frame_read.frame
     if frame is None:
-        return cached_frame if cached_frame is not None else None
-    
-    # Transformar y cachear
-    processed_frame = cv2.flip(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 0)
-    cached_frame = processed_frame
-    cached_frame_time = current_time
-    
-    return processed_frame
+        return None
+    return cv2.flip(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 0)
 
 def in_roi(cx, cy):
-    """Verifica si un punto está dentro del ROI"""
     return (ROI_LEFT <= cx <= ROI_RIGHT and ROI_TOP <= cy <= ROI_BOTTOM)
 
+def in_fire_roi(cx):
+    """ROI exclusivo para detección de fuegos"""
+    return (FIRE_ROI_LEFT <= cx <= FIRE_ROI_RIGHT)
+
 def get_mask_centroid(mask, w, h):
-    """Calcula el centroide de una máscara"""
-    mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    mask_resized = cv2.resize(mask, (w, h))
     mask_bin = (mask_resized > 0.5).astype(np.uint8)
     M = cv2.moments(mask_bin)
     if M["m00"] > 0:
         return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
     return None, None
 
+def draw_segmentation(frame, results):
+    """Dibuja las máscaras de segmentación"""
+    if not results or len(results) == 0:
+        return frame
+    
+    result = results[0]
+    
+    if result.masks is None or len(result.masks) == 0:
+        return frame
+    
+    # Crear overlay
+    overlay = frame.copy()
+    
+    boxes = result.boxes.xyxy.cpu().numpy()
+    masks = result.masks.data.cpu().numpy()
+    classes = result.boxes.cls.cpu().numpy().astype(int)
+    confidences = result.boxes.conf.cpu().numpy()
+    
+    h, w = frame.shape[:2]
+    center_x = w // 2
+    
+    for i, (box, mask, cls, conf) in enumerate(zip(boxes, masks, classes, confidences)):
+        class_name = result.names[cls]
+        color = COLORS[cls % len(COLORS)]
+        
+        # Redimensionar máscara al tamaño del frame
+        mask_resized = cv2.resize(mask, (w, h))
+        mask_binary = (mask_resized > 0.5).astype(np.uint8)
+        
+        # Crear máscara coloreada
+        colored_mask = np.zeros_like(frame)
+        colored_mask[mask_binary == 1] = color
+        
+        # Aplicar overlay con transparencia
+        overlay = cv2.addWeighted(overlay, 1.0, colored_mask, 0.4, 0)
+        
+        # Dibujar contorno de la máscara
+        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, color, 2)
+        
+        # Bounding box
+        x1, y1, x2, y2 = box.astype(int)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+        
+        # Label
+        label = f'{class_name} {conf:.2f}'
+        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(overlay, (x1, y1 - text_height - 10), (x1 + text_width, y1), color, -1)
+        cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Centroide para pipes
+        if class_name.lower() in ['pipes', 'pipe']:
+            cx, cy = get_mask_centroid(mask, w, h)
+            if cx is not None:
+                cv2.circle(overlay, (cx, cy), 8, color, -1)
+                error = cx - center_x
+                cv2.line(overlay, (center_x, cy), (cx, cy), color, 2)
+                cv2.putText(overlay, f"e:{error}", (cx+15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    return overlay
+
 # ============================================================
-# THREAD DE VISUALIZACIÓN (OPTIMIZADO)
+# THREAD DE VISUALIZACIÓN
 # ============================================================
 def display_thread():
-    global latest_frame, display_running, segment_counter
-    
-    skip_counter = 0
+    global display_running, segment_counter
     
     while display_running:
-        frame = get_frame(use_cache=True)
+        frame = get_frame()
         if frame is None:
             time.sleep(0.02)
-            continue
-        
-        skip_counter += 1
-        # Más agresivo en saltar frames cuando no está en modo corrección
-        skip_frames = 2 if in_correction_mode else 6
-        
-        if skip_counter % skip_frames != 0:
-            time.sleep(0.01)
             continue
         
         h, w = frame.shape[:2]
         center_x = w // 2
         
-        # Inferencia con tamaño adaptativo
-        inference_size = INFERENCE_SIZE if in_correction_mode else INFERENCE_SIZE_LIGHT
-        results = model(frame, conf=0.3, verbose=False, imgsz=inference_size)
+        # Inferencia
+        results = model(frame, conf=0.5, verbose=False, imgsz=INFERENCE_SIZE)
         
-        # Dibujar ROI
+        # Dibujar segmentación
+        frame = draw_segmentation(frame, results)
+        
+        # ROI pipes
         cv2.line(frame, (ROI_LEFT, 0), (ROI_LEFT, h), (0, 0, 255), 2)
         cv2.line(frame, (ROI_RIGHT, 0), (ROI_RIGHT, h), (0, 0, 255), 2)
         cv2.line(frame, (center_x, 0), (center_x, h), (255, 255, 0), 1)
         
-        # Procesar detecciones
-        if results and results[0].boxes is not None:
-            result = results[0]
-            boxes = result.boxes.xyxy.cpu().numpy()
-            classes = result.boxes.cls.cpu().numpy().astype(int)
-            confidences = result.boxes.conf.cpu().numpy()
-            
-            for i, (box, cls_id, conf) in enumerate(zip(boxes, classes, confidences)):
-                x1, y1, x2, y2 = map(int, box)
-                class_name = result.names[cls_id]
-                cx_box = (x1 + x2) // 2
-                cy_box = (y1 + y2) // 2
-                
-                color = (0, 255, 0) if in_roi(cx_box, cy_box) else (128, 128, 128)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"{class_name}:{conf:.2f}", (x1, y1-5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            
-            # Procesar máscaras solo para pipes (no fire)
-            if result.masks is not None:
-                for i, cls_id in enumerate(classes):
-                    class_name = result.names[cls_id].lower()
-                    if class_name in ['pipes', 'pipe', 'fire']:
-                        mask = result.masks.data[i].cpu().numpy()
-                        cx, cy = get_mask_centroid(mask, w, h)
-                        
-                        if cx is not None:
-                            # Color diferente para fuego
-                            if class_name == 'fire':
-                                color = (0, 0, 255) if in_roi(cx, cy) else (100, 0, 0)  # Rojo para fuego
-                            else:
-                                color = (0, 255, 255) if in_roi(cx, cy) else (100, 100, 100)
-                            
-                            cv2.circle(frame, (cx, cy), 8, color, -1)
-                            
-                            # Solo mostrar error para pipes
-                            if class_name in ['pipes', 'pipe']:
-                                error = cx - center_x
-                                cv2.line(frame, (center_x, cy), (cx, cy), color, 2)
-                                cv2.putText(frame, f"e:{error}", (cx+15, cy), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        # ROI fuegos (líneas naranjas)
+        cv2.line(frame, (FIRE_ROI_LEFT, 0), (FIRE_ROI_LEFT, h), (0, 165, 255), 2)
+        cv2.line(frame, (FIRE_ROI_RIGHT, 0), (FIRE_ROI_RIGHT, h), (0, 165, 255), 2)
         
-        # Info en pantalla
+        # Info
         cv2.putText(frame, f"Seg:{segment_counter}/26", (10, h-60), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        mode_text = "CORRIGIENDO" if in_correction_mode else "NAVEGANDO"
-        cv2.putText(frame, mode_text, (10, h-30), 
+        mode = "CORRIGIENDO" if in_correction_mode else "NAVEGANDO"
+        cv2.putText(frame, mode, (10, h-30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        latest_frame = frame.copy()
         cv2.imshow("Tello", frame)
         cv2.waitKey(1)
-        time.sleep(0.015)
+        time.sleep(0.03)
 
 threading.Thread(target=display_thread, daemon=True).start()
 
@@ -193,7 +195,6 @@ threading.Thread(target=display_thread, daemon=True).start()
 # NAVEGACIÓN
 # ============================================================
 def move_and_stabilize(distance=60):
-    """Mueve el drone y estabiliza"""
     global in_correction_mode
     in_correction_mode = False
     tello.move_forward(distance)
@@ -202,7 +203,6 @@ def move_and_stabilize(distance=60):
     time.sleep(1.0)
 
 def rotate_left():
-    """Rota 90° a la izquierda"""
     global in_correction_mode
     in_correction_mode = False
     tello.rotate_counter_clockwise(90)
@@ -212,17 +212,16 @@ def rotate_left():
 # CONTEO DE PIPES
 # ============================================================
 def count_pipes(samples=5):
-    """Cuenta pipes en ROI usando múltiples muestras"""
     counts = []
     
     for _ in range(samples):
-        frame = get_frame(use_cache=False)  # No cache para muestras independientes
+        frame = get_frame()
         if frame is None:
             time.sleep(0.1)
             continue
         
         h, w = frame.shape[:2]
-        results = model(frame, conf=0.3, verbose=False, imgsz=INFERENCE_SIZE)
+        results = model(frame, conf=0.5, verbose=False, imgsz=INFERENCE_SIZE)
         pipes_in_roi = 0
         
         if results and results[0].masks is not None:
@@ -231,7 +230,6 @@ def count_pipes(samples=5):
             
             for i, cls_id in enumerate(classes):
                 class_name = result.names[cls_id].lower()
-                # SOLO contar pipes, NO fuego
                 if class_name in ['pipes', 'pipe']:
                     mask = result.masks.data[i].cpu().numpy()
                     cx, cy = get_mask_centroid(mask, w, h)
@@ -244,25 +242,22 @@ def count_pipes(samples=5):
     return Counter(counts).most_common(1)[0][0] if counts else 0
 
 # ============================================================
-# CORRECCIÓN PD (SOLO PARA PIPES)
+# CORRECCIÓN PD
 # ============================================================
 def correction_phase():
-    """Control PD para centrar SOLO en pipes (NO en fuego)"""
     global in_correction_mode
     in_correction_mode = True
     
-    print(f"    → Control PD en PIPES ({CORRECTION_TIME}s)")
+    print(f"    → Control PD ({CORRECTION_TIME}s)")
     
     prev_error = 0
     prev_time = time.time()
     start_time = time.time()
     error_buffer = deque(maxlen=4)
     last_control = 0
-    corrections_made = 0
-    no_detection_count = 0
     
     while time.time() - start_time < CORRECTION_TIME:
-        frame = get_frame(use_cache=False)  # Frame fresco para control
+        frame = get_frame()
         if frame is None:
             time.sleep(0.02)
             continue
@@ -276,14 +271,6 @@ def correction_phase():
         
         pipe_found = False
         
-        # Debug: mostrar clases detectadas
-        if DEBUG_DETECTIONS and results and results[0].boxes is not None:
-            result = results[0]
-            classes = result.boxes.cls.cpu().numpy().astype(int)
-            detected_classes = [result.names[c] for c in classes]
-            if detected_classes:
-                print(f"      DEBUG: Clases detectadas: {set(detected_classes)}")
-        
         if results and results[0].masks is not None:
             result = results[0]
             classes = result.boxes.cls.cpu().numpy().astype(int)
@@ -291,34 +278,23 @@ def correction_phase():
             
             best_idx = None
             best_conf = 0
-            candidates_info = []
             
             for i, cls_id in enumerate(classes):
                 class_name = result.names[cls_id].lower()
                 
-                # ⚠️ SOLO buscar pipes, NO fire
                 if class_name in ['pipes', 'pipe']:
                     mask = result.masks.data[i].cpu().numpy()
                     cx, cy = get_mask_centroid(mask, w, h)
                     
                     if cx is not None:
                         conf = confidences[i]
-                        in_roi_flag = in_roi(cx, cy)
                         
-                        if DEBUG_DETECTIONS:
-                            candidates_info.append(f"{class_name}@({cx},{cy}) ROI:{in_roi_flag} conf:{conf:.2f}")
-                        
-                        if in_roi_flag and conf > best_conf:
+                        if in_roi(cx, cy) and conf > best_conf:
                             best_idx = i
                             best_conf = conf
             
-            # Debug: mostrar candidatos
-            if DEBUG_DETECTIONS and candidates_info:
-                print(f"      Candidatos: {' | '.join(candidates_info)}")
-            
             if best_idx is not None:
                 pipe_found = True
-                no_detection_count = 0
                 
                 mask = result.masks.data[best_idx].cpu().numpy()
                 cx, cy = get_mask_centroid(mask, w, h)
@@ -326,7 +302,6 @@ def correction_phase():
                 if cx is not None:
                     error = cx - center_x
                     
-                    # Filtrar error con buffer
                     error_buffer.append(error)
                     error_filtered = int(np.mean(error_buffer))
                     
@@ -337,28 +312,17 @@ def correction_phase():
                         d_term = KD * (error_filtered - prev_error) / dt
                         control = p_term + d_term
                         
-                        # Limitar cambios bruscos
                         control_change = abs(control - last_control)
                         if control_change > 10:
                             control = last_control + np.sign(control - last_control) * 10
                         
                         control = int(np.clip(control, -MAX_SPEED, MAX_SPEED))
-                        corrections_made += 1
                     
                     tello.send_rc_control(control, 0, 0, 0)
                     prev_error = error_filtered
                     last_control = control
-                    
-                    # Feedback cada 2 segundos
-                    elapsed = int(time.time() - start_time)
-                    if elapsed > 0 and elapsed % 2 == 0 and corrections_made > 0:
-                        print(f"      ✓ error:{error_filtered:4d} | ctrl:{control:3d}")
-                        corrections_made = 0
         
         if not pipe_found:
-            no_detection_count += 1
-            if DEBUG_DETECTIONS and no_detection_count % 20 == 0:
-                print(f"      ⚠ Sin pipe en ROI ({no_detection_count} frames)")
             tello.send_rc_control(0, 0, 0, 0)
             error_buffer.clear()
         
@@ -366,24 +330,21 @@ def correction_phase():
         time.sleep(0.05)
     
     tello.send_rc_control(0, 0, 0, 0)
-    print("    ✓ Corrección en pipes completa")
+    print("    ✓ Corrección completa")
     in_correction_mode = False
 
 # ============================================================
-# DETECCIÓN DE FUEGO CON LÓGICA DE POSICIÓN VERTICAL
+# DETECCIÓN DE FUEGO
 # ============================================================
 def detect_fire(segment_idx, segment_seen_prev):
-    """Detecta fuego y registra waypoint considerando posición vertical"""
-    frame = get_frame(use_cache=True)
+    frame = get_frame()
     if frame is None:
         return False
     
     h, w = frame.shape[:2]
     limit_line = int(h * HEIGHT_LIMIT_RATIO)
     
-    results = model(frame, conf=0.5, verbose=False)
-    
-    fire_detected = False
+    results = model(frame, conf=0.6, verbose=False)
     
     if results and results[0].boxes is not None:
         result = results[0]
@@ -400,30 +361,27 @@ def detect_fire(segment_idx, segment_seen_prev):
                 cx = int((x1 + x2) / 2)
                 cy = int((y1 + y2) / 2)
                 
+                # Verificar que esté dentro del ROI de fuegos
+                if not in_fire_roi(cx):
+                    continue
+                
                 if cf > best_conf:
                     best_conf = cf
                     best_center = (cx, cy)
         
         if best_center is not None:
-            fire_detected = True
             cx, cy = best_center
             
-            # ===============================
-            # LÓGICA DE REGISTRO
-            # ===============================
             if segment_seen_prev:
-                # Validar que esté suficientemente arriba para no ser el mismo fuego
                 if cy < limit_line:
                     wp.append(segment_idx)
-                    print(f"    🔥 Fuego registrado en seg {segment_idx}")
+                    print(f"    🔥 Fuego seg {segment_idx}")
                     return True
                 else:
-                    print(f"    🔥 Fuego ignorado en seg {segment_idx} (misma fuente visual)")
                     return False
             else:
-                # El segmento anterior no tenía fuego → registrar normal
                 wp.append(segment_idx)
-                print(f"    🔥 Fuego registrado en seg {segment_idx}")
+                print(f"    🔥 Fuego seg {segment_idx}")
                 return True
     
     return False
@@ -438,7 +396,6 @@ def run_route():
     for vuelta in range(2):
         print(f"\n{'='*50}\nVUELTA {vuelta+1}/2\n{'='*50}")
         
-        # Lado largo (6 segmentos)
         for j in range(6):
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
@@ -449,9 +406,9 @@ def run_route():
             while (time.time() - start) < 2.5:
                 segment_seen = detect_fire(segment_counter, segment_seen_prev)
             
-            if j < 5:  # Corrección excepto último segmento
+            if j < 5:
                 pipes = count_pipes(samples=5)
-                print(f"    📊 Pipes detectados: {pipes}")
+                print(f"    📊 Pipes: {pipes}")
                 if 0 < pipes <= 2:
                     correction_phase()
 
@@ -459,7 +416,6 @@ def run_route():
         
         rotate_left()
         
-        # Lado corto (7 segmentos)
         for j in range(7):
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
@@ -472,9 +428,9 @@ def run_route():
 
             segment_seen_prev = False if j == 0 else segment_seen
             
-            if j < 6:  # Corrección excepto último segmento
+            if j < 6:
                 pipes = count_pipes(samples=5)
-                print(f"    📊 Pipes detectados: {pipes}")
+                print(f"    📊 Pipes: {pipes}")
                 if 0 < pipes <= 2:
                     correction_phase()
         
@@ -495,26 +451,25 @@ def run_route():
             wpX.append(0)
             wpY.append(27-i)
     
-    print("\n✅ RUTA COMPLETADA")
-    print(f"Fuegos detectados: {len(wpX)} en los segmentos: ")
+    print("\n✅ COMPLETADO")
+    print(f"Fuegos: {len(wpX)}")
     for i in range(len(wpX)):
-        print(f"({wpX[i]}),({wpY[i]})")
+        print(f"({wpX[i]},{wpY[i]})")
 
-
-    with open('waypoints.csv', "w", newline = "") as f:
+    with open('waypoints.csv', "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["wpX","wpY"])
         for x,y in zip(wpX, wpY):
             writer.writerow([x,y])
     
-    print("Archivo waypoints.csv guardado correctamente. ")
+    print("waypoints.csv guardado")
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
     try:
-        input("Presiona ENTER para despegar...")
+        input("ENTER para despegar...")
         
         tello.takeoff()
         time.sleep(3)
@@ -534,5 +489,4 @@ if __name__ == "__main__":
         tello.land()
         tello.streamoff()
         cv2.destroyAllWindows()
-
-        print("poñoñin uwu")
+        print("poñoñin yolo1")
