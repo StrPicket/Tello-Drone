@@ -695,7 +695,7 @@ if __name__ == "__main__":
         tello.takeoff()
         
         #print("⏳ Esperando 3s...")
-        #time.sleep(3)
+        time.sleep(3)
         #print("✓ Listo para iniciar")
 
         
