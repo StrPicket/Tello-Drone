@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 from djitellopy import Tello
@@ -5,6 +6,7 @@ from ultralytics import YOLO
 import time
 import threading
 from collections import deque, Counter
+import csv
 
 # ============================================================
 # CONFIGURACIÓN
@@ -14,7 +16,7 @@ KP = 0.25
 KD = 0.2
 DEADZONE = 60
 MAX_SPEED = 18
-CORRECTION_TIME = 10.0
+CORRECTION_TIME = 5.0
 INFERENCE_SIZE = 224
 INFERENCE_SIZE_LIGHT = 160
 
@@ -50,6 +52,7 @@ CACHE_DURATION = 0.05  # Cache de 50ms para evitar lecturas redundantes
 display_running = True
 in_correction_mode = False
 segment_counter = 0
+wp= []
 wpX = []
 wpY = []
 
@@ -366,6 +369,7 @@ def correction_phase():
 # ============================================================
 def detect_fire(segment_idx, prev_had_fire):
     """Detecta fuego y registra waypoint (SIN centrado)"""
+
     frame = get_frame(use_cache=True)
     if frame is None:
         return False, False
@@ -378,8 +382,7 @@ def detect_fire(segment_idx, prev_had_fire):
         fire_detected = any(results[0].names[c].lower() == 'fire' for c in classes)
     
     if fire_detected and not prev_had_fire:
-        wpX.append(segment_idx)
-        wpY.append(0)
+        wp.append(segment_idx)
         print(f"    🔥 Fuego detectado en seg {segment_idx} (sin centrado)")
     
     return fire_detected, fire_detected
@@ -401,7 +404,10 @@ def run_route():
             print(f"\nSeg {segment_counter}")
             
             move_and_stabilize()
-            _, segment_seen = detect_fire(segment_counter, segment_seen)
+            start = time.time()
+
+            while(time.time() - start) < 2.5:
+                _, segment_seen = detect_fie(segment_counter, segment_seen)
             
             if j < 5:  # Corrección excepto último segmento
                 pipes = count_pipes(samples=5)
@@ -417,7 +423,10 @@ def run_route():
             print(f"\nSeg {segment_counter}")
             
             move_and_stabilize()
-            _, segment_seen = detect_fire(segment_counter, segment_seen)
+            start = time.time()
+            
+            while(time.time() - start) < 2.5:
+                _, segment_seen = detect_fie(segment_counter, segment_seen)
             
             if j < 6:  # Corrección excepto último segmento
                 pipes = count_pipes(samples=5)
@@ -426,9 +435,35 @@ def run_route():
                     correction_phase()
         
         rotate_left()
+
+
+    for i in wp:
+        if i <= 6 :
+            wpX.append(i)
+            wpY.append(0)
+        elif i <= 13:
+            wpX.append(6)
+            wpY.append(i-6)
+        elif i <= 19:
+            wpX.append(19-i)
+            wpY.append(7)
+        else:
+            wpX.append(0)
+            wpY.append(27-i)
     
     print("\n✅ RUTA COMPLETADA")
-    print(f"Fuegos detectados: {len(wpX)} en segmentos {wpX}")
+    print(f"Fuegos detectados: {len(wpX)} en los segmentos: ")
+    for i in range(len(wpX)):
+        print(f"({wpX[i]}),({wpY[i]})")
+
+
+    with open('waypoints.csv', "w", newline = "") as f:
+        writer = csv.writer(f)
+        writer.writerow(["wpX","wpY"])
+        for x,y in zip(wpX, wpY):
+            writer.writerow([x,Y])
+    
+    print("Archivo waypoints.csv guardado correctamente. ")
 
 # ============================================================
 # MAIN
