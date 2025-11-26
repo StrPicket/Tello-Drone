@@ -31,6 +31,9 @@ ROI_BOTTOM = 480
 # Debug (opcional)
 DEBUG_DETECTIONS = False  # Cambiar a True para ver más info
 
+# Límite vertical para evitar repetición de fuego
+HEIGHT_LIMIT_RATIO = 0.7   # 70% desde arriba de la imagen
+
 # ============================================================
 # SETUP
 # ============================================================
@@ -367,68 +370,109 @@ def correction_phase():
     in_correction_mode = False
 
 # ============================================================
-# DETECCIÓN DE FUEGO
+# DETECCIÓN DE FUEGO CON LÓGICA DE POSICIÓN VERTICAL
 # ============================================================
-def detect_fire(segment_idx, prev_had_fire):
-    """Detecta fuego y registra waypoint (SIN centrado)"""
-
+def detect_fire(segment_idx, segment_seen_prev):
+    """Detecta fuego y registra waypoint considerando posición vertical"""
     frame = get_frame(use_cache=True)
     if frame is None:
-        return False, False
+        return False
+    
+    h, w = frame.shape[:2]
+    limit_line = int(h * HEIGHT_LIMIT_RATIO)
     
     results = model(frame, conf=0.4, verbose=False, imgsz=160)
     
     fire_detected = False
+    
     if results and results[0].boxes is not None:
-        classes = results[0].boxes.cls.cpu().numpy().astype(int)
-        fire_detected = any(results[0].names[c].lower() == 'fire' for c in classes)
+        result = results[0]
+        boxes = result.boxes.xyxy.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        confs = result.boxes.conf.cpu().numpy()
+        
+        best_conf = 0
+        best_center = None
+        
+        for box, cls_id, cf in zip(boxes, classes, confs):
+            if result.names[cls_id].lower() == 'fire':
+                x1, y1, x2, y2 = box
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                
+                if cf > best_conf:
+                    best_conf = cf
+                    best_center = (cx, cy)
+        
+        if best_center is not None:
+            fire_detected = True
+            cx, cy = best_center
+            
+            # ===============================
+            # LÓGICA DE REGISTRO
+            # ===============================
+            if segment_seen_prev:
+                # Validar que esté suficientemente arriba para no ser el mismo fuego
+                if cy < limit_line:
+                    wp.append(segment_idx)
+                    print(f"    🔥 Fuego registrado en seg {segment_idx}")
+                    return True
+                else:
+                    print(f"    🔥 Fuego ignorado en seg {segment_idx} (misma fuente visual)")
+                    return False
+            else:
+                # El segmento anterior no tenía fuego → registrar normal
+                wp.append(segment_idx)
+                print(f"    🔥 Fuego registrado en seg {segment_idx}")
+                return True
     
-    if fire_detected and not prev_had_fire:
-        wp.append(segment_idx)
-        print(f"    🔥 Fuego detectado en seg {segment_idx} (sin centrado)")
-    
-    return fire_detected, fire_detected
+    return False
 
 # ============================================================
 # RUTA PRINCIPAL
 # ============================================================
 def run_route():
     global segment_counter
-    
-    segment_seen = False
+    segment_seen_prev = False 
     
     for vuelta in range(2):
         print(f"\n{'='*50}\nVUELTA {vuelta+1}/2\n{'='*50}")
         
         # Lado largo (6 segmentos)
         for j in range(6):
+            segment_seen = False
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
             
             move_and_stabilize()
             start = time.time()
 
-            while(time.time() - start) < 2.5:
-                _, segment_seen = detect_fire(segment_counter, segment_seen)
+            while (time.time() - start) < 2.5 or segment_seen == False:
+                segment_seen = detect_fire(segment_counter, segment_seen_prev)
             
             if j < 5:  # Corrección excepto último segmento
                 pipes = count_pipes(samples=5)
                 print(f"    📊 Pipes detectados: {pipes}")
                 if 0 < pipes <= 2:
                     correction_phase()
+
+            segment_seen_prev = False if j == 0 else segment_seen
         
         rotate_left()
         
         # Lado corto (7 segmentos)
         for j in range(7):
+            segment_seen = False
             segment_counter += 1
             print(f"\nSeg {segment_counter}")
             
             move_and_stabilize()
             start = time.time()
             
-            while(time.time() - start) < 2.5:
-                _, segment_seen = detect_fire(segment_counter, segment_seen)
+            while (time.time() - start) < 2.5 or segment_seen == False:
+                segment_seen = detect_fire(segment_counter, segment_seen_prev)
+
+            segment_seen_prev = False if j == 0 else segment_seen
             
             if j < 6:  # Corrección excepto último segmento
                 pipes = count_pipes(samples=5)
@@ -438,9 +482,8 @@ def run_route():
         
         rotate_left()
 
-
     for i in wp:
-        if i <= 6 :
+        if i <= 6:
             wpX.append(i)
             wpY.append(0)
         elif i <= 13:
@@ -492,3 +535,5 @@ if __name__ == "__main__":
         tello.land()
         tello.streamoff()
         cv2.destroyAllWindows()
+
+        print("p")
