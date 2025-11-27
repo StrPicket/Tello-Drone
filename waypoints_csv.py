@@ -32,6 +32,8 @@ except FileNotFoundError:
     print("Asegúrate de que esté en la misma carpeta que este .py\n")
     raise
 
+wpX.append(0)
+wpY.append(0)
 
 positionX = 0
 positionY = 0
