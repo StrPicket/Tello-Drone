@@ -2,6 +2,8 @@ import time
 import math
 from collections import deque
 import csv
+import threading
+from queue import Queue, Empty
 
 import cv2
 import numpy as np
@@ -52,7 +54,6 @@ MAX_SPEED = 18
 
 CORRECTION_TIME = 15.0
 INFERENCE_SIZE = 224
-FRAME_SKIP = 2
 
 WAYPOINT_HOVER_TIME = 5.0
 
@@ -71,33 +72,112 @@ tello = None
 model = None
 frame_read = None
 
+# Thread-safe variables
+latest_frame = None
+frame_lock = threading.Lock()
+stop_video_thread = False
+video_thread = None
+
 # ============================================================
-# UTILIDADES NAVEGACIÓN
+# THREAD DE CAPTURA DE VIDEO - SIEMPRE ACTIVO
 # ============================================================
-def normalize_angle(angle_deg: float) -> int:
-    return -int((angle_deg + 180) % 360 - 180)
+def video_capture_thread():
+    """Thread dedicado a capturar frames continuamente sin procesamiento pesado"""
+    global latest_frame, stop_video_thread, frame_read
+    
+    print("[VIDEO] Thread de captura iniciado")
+    consecutive_failures = 0
+    max_failures = 30
+    
+    while not stop_video_thread:
+        try:
+            if frame_read is None:
+                time.sleep(0.1)
+                continue
+                
+            frame = frame_read.frame
+            
+            if frame is not None:
+                # Solo flip básico, sin procesamiento pesado
+                frame = cv2.flip(frame, 0)
+                if FLIP_HORIZONTAL:
+                    frame = cv2.flip(frame, 1)
+                if FLIP_VERTICAL:
+                    frame = cv2.flip(frame, 0)
+                
+                with frame_lock:
+                    latest_frame = frame.copy()
+                
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures > max_failures:
+                    print(f"[VIDEO] ⚠ {consecutive_failures} frames fallidos, intentando reconectar stream...")
+                    try:
+                        reconnect_stream()
+                        consecutive_failures = 0
+                    except Exception as e:
+                        print(f"[VIDEO] Error al reconectar: {e}")
+                
+            time.sleep(0.01)  # ~100 FPS max, pero sin procesamiento
+            
+        except Exception as e:
+            print(f"[VIDEO] Error en captura: {e}")
+            time.sleep(0.1)
+    
+    print("[VIDEO] Thread de captura detenido")
 
 
-def rotate_tello(t: Tello, angle: int):
-    if angle > 0:
-        t.rotate_clockwise(angle)
-    elif angle < 0:
-        t.rotate_counter_clockwise(-angle)
+def reconnect_stream():
+    """Intenta reconectar el stream de video"""
+    global frame_read, tello
+    
+    print("[VIDEO] Reconectando stream...")
+    try:
+        tello.streamoff()
+        time.sleep(1)
+        tello.streamon()
+        time.sleep(2)
+        frame_read = tello.get_frame_read()
+        print("[VIDEO] ✓ Stream reconectado")
+    except Exception as e:
+        print(f"[VIDEO] Error en reconexión: {e}")
+
+
+def get_latest_frame():
+    """Obtiene el último frame de forma thread-safe"""
+    with frame_lock:
+        if latest_frame is not None:
+            return latest_frame.copy()
+    return None
 
 
 def fix_image(frame):
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    if FLIP_HORIZONTAL:
-        frame = cv2.flip(frame, 1)
-    if FLIP_VERTICAL:
-        frame = cv2.flip(frame, 0)
-    return frame
+    """Conversión de color simple - los flips ya se hacen en el thread"""
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
 
 # ============================================================
-# FASE DE CORRECCIÓN: CENTRAR "Fire"
+# VISUALIZACIÓN LIGERA (sin YOLO)
+# ============================================================
+def show_simple_frame(text="Navegando...", color=(0, 255, 0)):
+    """Muestra frame sin procesamiento pesado"""
+    frame = get_latest_frame()
+    if frame is None:
+        return
+    
+    display = frame.copy()
+    cv2.putText(display, text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    cv2.imshow("Tello View", display)
+    cv2.waitKey(1)
+
+
+# ============================================================
+# FASE DE CORRECCIÓN: CENTRAR "Fire" (PROCESAMIENTO PESADO)
 # ============================================================
 def correction_phase():
-    global frame_read, model, tello
+    global model, tello
 
     print("  → correction_phase INICIADA")
 
@@ -105,7 +185,8 @@ def correction_phase():
     prev_time = time.time()
     frame_counter = 0
     stable_center_frames = 0
-    error_buffer = deque(maxlen=4)
+    error_bufferX = deque(maxlen=4)
+    error_bufferY = deque(maxlen=4)
     start_time = time.time()
     already_lifted = False
 
@@ -115,24 +196,22 @@ def correction_phase():
             print("  → Tiempo de corrección agotado, saliendo.")
             return
 
-        frame = frame_read.frame
+        # Obtener frame del thread (siempre disponible)
+        frame = get_latest_frame()
         if frame is None:
+            print("  ⚠ Sin frame disponible")
+            time.sleep(0.1)
             continue
 
-        frame = cv2.flip(frame, 0)
         img = fix_image(frame)
-
         h, w = img.shape[:2]
         center_x = w // 2
-
-        display = img.copy()
-        cv2.putText(display, "Buscando Fire...", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.imshow("Correction View", display)
-        cv2.waitKey(1)
+        center_y = h // 2
 
         frame_counter += 1
-        if frame_counter % FRAME_SKIP != 0:
+        # Reducir frecuencia de YOLO para no saturar
+        if frame_counter % 3 != 0:  # Procesar cada 3 frames
+            show_simple_frame("Buscando Fire...", (255, 255, 0))
             continue
 
         current_time = time.time()
@@ -183,37 +262,49 @@ def correction_phase():
         if not found:
             cv2.putText(vis, "NO FIRE", (10, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-            cv2.imshow("Correction View", vis)
+            cv2.imshow("Tello View", vis)
             cv2.waitKey(1)
 
             tello.send_rc_control(0, 0, 0, 0)
+            time.sleep(0.1)
 
             if not already_lifted:
                 print("  → No se ve Fire, SUBIENDO 40 cm...")
                 already_lifted = True
-                time.sleep(0.5)
-                tello.move_up(ALTITUDE_DELTA_CM)
-                time.sleep(1.0)
+                try:
+                    tello.move_up(ALTITUDE_DELTA_CM)
+                    time.sleep(1.0)
+                except Exception as e:
+                    print(f"  ⚠ Error al subir: {e}")
                 continue
-            tello.move_down(ALTITUDE_DELTA_CM)
+            
+            try:
+                tello.move_down(ALTITUDE_DELTA_CM)
+            except Exception as e:
+                print(f"  ⚠ Error al bajar: {e}")
             continue
 
         # ---------------- SÍ ENCUENTRA ----------------
         error = cx - center_x
-        error_buffer.append(error)
-        err_filtered = int(np.mean(error_buffer))
+        errorY = cy - center_y
+        error_bufferX.append(error)
+        error_bufferY.append(errorY)
+        err_filtered = int(np.mean(error_bufferX))
+        err_filteredY = int(np.mean(error_bufferY))        
 
-        if abs(err_filtered) < DEADZONE:
+        if abs(err_filtered) < DEADZONE and abs(err_filteredY) < DEADZONE:
             control = int(np.clip(err_filtered * 0.08, -8, 8))
+            controlY = 0
         else:
             p_term = KP * err_filtered
             d_term = KD * (err_filtered - prev_error) / dt
             control = p_term + d_term
             control = int(np.clip(control, -MAX_SPEED, MAX_SPEED))
+            controlY = int(np.clip(KP*-err_filteredY, -MAX_SPEED, MAX_SPEED))
 
         prev_error = err_filtered
 
-        tello.send_rc_control(-control, 0, 0, 0)
+        tello.send_rc_control(-control, 0, -controlY, 0)
 
         cv2.line(vis, (center_x, 0), (center_x, h), (255, 255, 255), 2)
         cv2.circle(vis, (cx, cy), 6, (0, 0, 255), -1)
@@ -224,7 +315,7 @@ def correction_phase():
         cv2.putText(vis, f"conf={best_conf:.2f}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        cv2.imshow("Correction View", vis)
+        cv2.imshow("Tello View", vis)
         cv2.waitKey(1)
 
         if abs(err_filtered) < CENTER_TOLERANCE:
@@ -237,39 +328,69 @@ def correction_phase():
             tello.send_rc_control(0, 0, 0, 0)
             time.sleep(0.5)
 
-            tello.move_down(ALTITUDE_DELTA_CM)
-            time.sleep(3.0)
-            tello.move_up(ALTITUDE_DELTA_CM)
-            time.sleep(0.5)
+            try:
+                tello.move_down(ALTITUDE_DELTA_CM)
+                time.sleep(3.0)
+                tello.move_up(ALTITUDE_DELTA_CM)
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"  ⚠ Error en maniobra: {e}")
 
             print("  ✓ Maniobra completada. Saliendo de correction_phase.")
             tello.send_rc_control(0, 0, 0, 0)
             return
 
+
+# ============================================================
+# COMANDOS SEGUROS CON REINTENTOS
+# ============================================================
+def safe_command(command_func, *args, max_retries=3, **kwargs):
+    """Ejecuta comando con reintentos y manejo de errores"""
+    for attempt in range(max_retries):
+        try:
+            command_func(*args, **kwargs)
+            return True
+        except Exception as e:
+            print(f"  ⚠ Intento {attempt+1}/{max_retries} falló: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+            else:
+                print(f"  ✗ Comando falló después de {max_retries} intentos")
+                return False
+
+
 # ============================================================
 # PROGRAMA PRINCIPAL
 # ============================================================
 def main():
-    global tello, model, frame_read
+    global tello, model, frame_read, stop_video_thread, video_thread
     global positionX, positionY, heading
 
     tello = Tello()
     tello.connect()
     print("Batería:", tello.get_battery(), "%")
 
+    # Iniciar stream
     tello.streamon()
     time.sleep(2)
     frame_read = tello.get_frame_read()
+    time.sleep(1)
+
+    # Iniciar thread de video ANTES de cualquier otra cosa
+    stop_video_thread = False
+    video_thread = threading.Thread(target=video_capture_thread, daemon=True)
+    video_thread.start()
+    time.sleep(1)  # Dar tiempo a que el thread capture frames
 
     print("Cargando modelo YOLO...")
     model = YOLO(MODEL_PATH)
     print("Modelo YOLO cargado.")
 
     try:
-        tello.takeoff()
+        safe_command(tello.takeoff)
         time.sleep(2)
 
-        tello.move_up(30)
+        safe_command(tello.move_up, 30)
         time.sleep(2)
 
         for i in range(len(wpX)):
@@ -277,7 +398,8 @@ def main():
             dy = wpY[i] - positionY
 
             target_angle = math.degrees(math.atan2(dy, dx))
-            turn_angle = normalize_angle(target_angle - heading)
+            turn_angle = int((target_angle - heading + 180) % 360 - 180)
+            turn_angle = -turn_angle
 
             distance = int(math.sqrt(dx**2 + dy**2) * 60)
 
@@ -286,54 +408,60 @@ def main():
             print(f"  Giro relativo: {turn_angle}°")
             print(f"  Distancia:     {distance} cm (aprox)")
 
+            # Rotación segura
             if abs(turn_angle) > 5:
-                rotate_tello(tello, turn_angle)
+                if turn_angle > 0:
+                    safe_command(tello.rotate_clockwise, abs(turn_angle))
+                else:
+                    safe_command(tello.rotate_counter_clockwise, abs(turn_angle))
                 time.sleep(1)
 
+            # Movimiento seguro
             distance_clamped = max(20, min(500, distance))
-            tello.move_forward(distance_clamped)
+            safe_command(tello.move_forward, distance_clamped)
             time.sleep(1)
             print("  ✓ Waypoint alcanzado")
 
+            # Hover con visualización ligera (sin YOLO)
             hover_start = time.time()
             while time.time() - hover_start < WAYPOINT_HOVER_TIME:
-                frame = frame_read.frame
-                if frame is None:
-                    continue
-                frame = cv2.flip(frame, 0)
-                img = fix_image(frame)
-                cv2.putText(img, f"Waypoint {i+1} hover",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
-                cv2.imshow("Correction View", img)
-                cv2.waitKey(1)
+                show_simple_frame(f"Waypoint {i+1} hover", (255, 255, 0))
                 time.sleep(0.03)
 
             positionX = wpX[i]
             positionY = wpY[i]
             heading = target_angle
 
+            # AHORA SÍ procesamiento pesado
             correction_phase()
 
         print("\nRuta completada. Aterrizando...")
-        tello.land()
+        safe_command(tello.land)
 
     except KeyboardInterrupt:
-        print("\nInterrumpido por el usuario.")
-        try:
-            tello.land()
-        except Exception:
-            pass
+        print("\n⚠ Interrumpido por el usuario.")
+        tello.send_rc_control(0, 0, 0, 0)
+        time.sleep(0.5)
+        safe_command(tello.land)
 
     except Exception as e:
-        print("\nError en ejecución:", e)
-        try:
-            tello.land()
-        except Exception:
-            pass
+        print(f"\n✗ Error en ejecución: {e}")
+        import traceback
+        traceback.print_exc()
+        tello.send_rc_control(0, 0, 0, 0)
+        safe_command(tello.land)
 
     finally:
-        tello.streamoff()
+        # Detener thread de video
+        stop_video_thread = True
+        if video_thread:
+            video_thread.join(timeout=2)
+        
+        try:
+            tello.streamoff()
+        except:
+            pass
+        
         cv2.destroyAllWindows()
         tello.end()
         print("Recursos liberados.")

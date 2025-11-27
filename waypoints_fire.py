@@ -1,8 +1,10 @@
 import time
 import math
 from collections import deque
+import threading
 
 import cv2
+import csv
 import numpy as np
 from djitellopy import Tello
 from ultralytics import YOLO
@@ -10,8 +12,29 @@ from ultralytics import YOLO
 # ============================================================
 # CONFIGURACIÓN DE WAYPOINTS
 # ============================================================
-wpX = [2, 5, 6, 0]
-wpY = [0, 1, 4, 0]
+
+wpX = []
+wpY = []
+
+try:
+    with open("waypoints.csv", "r") as f:
+        reader = csv.reader(f)
+        next(reader)   # Saltar encabezado
+        for row in reader:
+            wpX.append(int(row[0]))
+            wpY.append(int(row[1]))
+
+    print("Waypoints leídos correctamente.")
+    print("X:", wpX)
+    print("Y:", wpY)
+
+except FileNotFoundError:
+    print("\nERROR: No se encontró 'waypoints.csv'.")
+    print("Asegúrate de que esté en la misma carpeta que este .py\n")
+    raise
+
+wpX.append(0)
+wpY.append(0)
 
 positionX = 0
 positionY = 0
@@ -34,7 +57,7 @@ CORRECTION_TIME = 15.0      # ⬅️ más tiempo de corrección por waypoint (s)
 INFERENCE_SIZE = 224
 FRAME_SKIP = 2              # saltar frames para no saturar CPU
 
-WAYPOINT_HOVER_TIME = 5.0   # ⬅️ tiempo de “espera” en cada waypoint (s)
+WAYPOINT_HOVER_TIME = 5.0   # ⬅️ tiempo de "espera" en cada waypoint (s)
 
 # Parámetros para decidir cuándo "ya lo centró"
 CENTER_TOLERANCE = 25       # píxeles alrededor del centro
@@ -54,6 +77,47 @@ FLIP_VERTICAL = False      # flip adicional dentro de fix_image
 tello = None
 model = None
 frame_read = None
+video_thread = None
+running = False
+current_status = "Inicializando..."
+
+
+# ============================================================
+# HILO DE VIDEO CONTINUO
+# ============================================================
+def video_display_thread():
+    """
+    Hilo que corre continuamente mostrando la cámara
+    sin importar qué esté haciendo el dron.
+    """
+    global frame_read, running, current_status
+    
+    while running:
+        try:
+            frame = frame_read.frame
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            # Aplicar transformaciones
+            frame = cv2.flip(frame, 0)
+            img = fix_image(frame)
+
+            # Agregar información de estado
+            cv2.putText(img, current_status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            cv2.imshow("Tello Camera - Live View", img)
+            
+            # Permitir cerrar con 'q'
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+            time.sleep(0.01)  # ~100 FPS máx para no saturar
+            
+        except Exception as e:
+            print(f"Error en video thread: {e}")
+            time.sleep(0.1)
 
 
 # ============================================================
@@ -70,6 +134,9 @@ def rotate_tello(t: Tello, angle: int):
       angle > 0 → clockwise
       angle < 0 → counter_clockwise
     """
+    global current_status
+    current_status = f"Girando {angle}°..."
+    
     if angle > 0:
         t.rotate_clockwise(angle)
     elif angle < 0:
@@ -84,12 +151,6 @@ def fix_image(frame):
     - Hacemos mirror horizontal y/o vertical
     """
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    if FLIP_HORIZONTAL:
-        frame = cv2.flip(frame, 1)
-    if FLIP_VERTICAL:
-        frame = cv2.flip(frame, 0)
-
     return frame
 
 
@@ -98,37 +159,28 @@ def fix_image(frame):
 # ============================================================
 def correction_phase():
     """
-    Lógica:
-
-    1. Siempre muestra la imagen.
-    2. Si no encuentra Fire al principio del waypoint:
-         → sube 20 cm (solo una vez) y vuelve a buscar.
-    3. Si después de subir y durante CORRECTION_TIME no encuentra Fire:
-         → sale y pasa al siguiente waypoint.
-    4. Si encuentra Fire:
-         → corrección lateral (PD) hasta centrar.
-         → cuando está centrado varios frames:
-               baja 20 cm, espera 3s, sube 20 cm y sale.
+    Lógica de corrección con detección YOLO en el hilo de video.
     """
-
-    global frame_read, model, tello
+    global frame_read, model, tello, current_status
 
     print("  → correction_phase INICIADA")
+    current_status = "Buscando Fire..."
 
     prev_error = 0
     prev_time = time.time()
     frame_counter = 0
     stable_center_frames = 0
-    error_buffer = deque(maxlen=4)
-    last_control = 0
+    error_bufferX = deque(maxlen=4)
+    error_bufferY = deque(maxlen=4)
     start_time = time.time()
 
-    already_lifted = False  # para subir 20 cm solo una vez
+    already_lifted = False
 
     while True:
         # Timeout general
         if time.time() - start_time > CORRECTION_TIME:
             tello.send_rc_control(0, 0, 0, 0)
+            current_status = "Timeout - pasando al siguiente waypoint"
             print("  → Tiempo de corrección agotado, saliendo.")
             return
 
@@ -136,19 +188,12 @@ def correction_phase():
         if frame is None:
             continue
 
-        # Igual que tu script que funciona:
         frame = cv2.flip(frame, 0)
         img = fix_image(frame)
 
         h, w = img.shape[:2]
         center_x = w // 2
-
-        # Mostrar SIEMPRE la imagen (aunque no haya Fire)
-        display = img.copy()
-        cv2.putText(display, "Buscando Fire...", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.imshow("Correction View", display)
-        cv2.waitKey(1)
+        center_y = h // 2
 
         frame_counter += 1
         if frame_counter % FRAME_SKIP != 0:
@@ -159,13 +204,11 @@ def correction_phase():
         prev_time = current_time
 
         # ---------------- YOLO ----------------
-        results = model(img, conf=0.2, verbose=False, imgsz=INFERENCE_SIZE)
+        results = model(img, conf=0.2, verbose=False)
 
         found = False
         cx = cy = None
         best_conf = 0.0
-
-        vis = img.copy()
 
         if len(results) > 0:
             r = results[0]
@@ -177,85 +220,56 @@ def correction_phase():
                 confs = boxes.conf.cpu().numpy()
                 xyxy = boxes.xyxy.cpu().numpy()
 
-                # Dibujar TODAS las detecciones (como en tu script simple)
                 for i, cls_id in enumerate(cls_ids):
                     class_name = class_names[cls_id]
                     conf = float(confs[i])
-                    x1, y1, x2, y2 = xyxy[i].astype(int)
 
-                    # caja general
-                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cv2.putText(vis, f"{class_name} {conf:.2f}",
-                                (x1, y1 - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-                    # buscamos la mejor Fire
                     if class_name.lower() == TARGET_CLASS.lower():
                         if conf > best_conf:
                             best_conf = conf
+                            x1, y1, x2, y2 = xyxy[i].astype(int)
                             cx = int((x1 + x2) / 2)
                             cy = int((y1 + y2) / 2)
                             found = True
 
-                # si hay Fire, remarcar en rojo
-                if found:
-                    cv2.putText(vis, "FIRE!", (cx - 20, cy + 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
         # ---------------- LÓGICA SI NO ENCUENTRA ----------------
         if not found:
-            # texto de NO FIRE
-            cv2.putText(vis, "NO FIRE", (10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-            cv2.imshow("Correction View", vis)
-            cv2.waitKey(1)
-
+            current_status = "NO FIRE detectado"
             tello.send_rc_control(0, 0, 0, 0)
 
-            # subir 20 cm solo la primera vez
             if not already_lifted:
                 print("  → No se ve Fire, SUBIENDO 40 cm...")
+                current_status = "Subiendo para buscar Fire..."
                 already_lifted = True
                 time.sleep(0.5)
                 tello.move_up(ALTITUDE_DELTA_CM)
                 time.sleep(1.0)
-                # después de subir, vuelve a intentar detección
                 continue
 
-            # si ya subió y sigue sin ver Fire, el while saldrá por timeout
-            tello.move_down(ALTITUDE_DELTA_CM)
             continue
 
         # ---------------- LÓGICA SI ENCUENTRA ----------------
-        # control lateral para centrar
         error = cx - center_x
-        error_buffer.append(error)
-        err_filtered = int(np.mean(error_buffer))
+        errorY = cy - center_y
+        error_bufferX.append(error)
+        error_bufferY.append(errorY)
+        err_filtered = int(np.mean(error_bufferX))
+        err_filteredY = int(np.mean(error_bufferY))        
 
-        if abs(err_filtered) < DEADZONE:
+        if abs(err_filtered) < DEADZONE and abs(err_filteredY) < DEADZONE:
             control = int(np.clip(err_filtered * 0.08, -8, 8))
+            controlY = 0
         else:
             p_term = KP * err_filtered
             d_term = KD * (err_filtered - prev_error) / dt
             control = p_term + d_term
             control = int(np.clip(control, -MAX_SPEED, MAX_SPEED))
+            controlY = int(np.clip(KP*-err_filteredY, -MAX_SPEED, MAX_SPEED))
 
         prev_error = err_filtered
 
-        tello.send_rc_control(-control, 0, 0, 0)
-
-        # Visualización de centrado
-        cv2.line(vis, (center_x, 0), (center_x, h), (255, 255, 255), 2)
-        cv2.circle(vis, (cx, cy), 6, (0, 0, 255), -1)
-        cv2.putText(vis, f"err={err_filtered}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(vis, f"ctrl={control}", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(vis, f"conf={best_conf:.2f}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        cv2.imshow("Correction View", vis)
-        cv2.waitKey(1)
+        tello.send_rc_control(control, 0, -controlY, 0)
+        current_status = f"Fire detectado - Centrando (err={err_filtered}, ctrl={control})"
 
         # Comprobar centrado
         if abs(err_filtered) < CENTER_TOLERANCE:
@@ -266,16 +280,21 @@ def correction_phase():
         # Si lleva varios frames centrado → maniobra y salir
         if stable_center_frames >= DETECTION_STABLE_FRAMES:
             print("  ✓ Fire centrado. Ejecutando maniobra bajada/subida...")
+            current_status = "Fire centrado - Ejecutando maniobra"
             tello.send_rc_control(0, 0, 0, 0)
             time.sleep(0.5)
 
+            current_status = "Bajando 40cm..."
             tello.move_down(ALTITUDE_DELTA_CM)
             time.sleep(3.0)
+            
+            current_status = "Subiendo 40cm..."
             tello.move_up(ALTITUDE_DELTA_CM)
             time.sleep(0.5)
 
             print("  ✓ Maniobra completada. Saliendo de correction_phase.")
             tello.send_rc_control(0, 0, 0, 0)
+            current_status = "Maniobra completada"
             return
 
 
@@ -283,7 +302,7 @@ def correction_phase():
 # PROGRAMA PRINCIPAL
 # ============================================================
 def main():
-    global tello, model, frame_read
+    global tello, model, frame_read, video_thread, running, current_status
     global positionX, positionY, heading
 
     # ----- Inicializar Tello -----
@@ -292,26 +311,41 @@ def main():
     print("Batería:", tello.get_battery(), "%")
 
     # ----- Video -----
+    current_status = "Iniciando video..."
     tello.streamon()
     time.sleep(2)
     frame_read = tello.get_frame_read()
 
+    # ----- Iniciar hilo de video continuo -----
+    running = True
+    video_thread = threading.Thread(target=video_display_thread, daemon=True)
+    video_thread.start()
+    print("Hilo de video iniciado")
+    time.sleep(1)
+
     # ----- Cargar modelo YOLO -----
     print("Cargando modelo YOLO...")
+    current_status = "Cargando modelo YOLO..."
     model = YOLO(MODEL_PATH)
     print("Modelo YOLO cargado.")
 
     try:
         # Despegue
+        current_status = "Despegando..."
         tello.takeoff()
         time.sleep(2)
 
         # (opcional) subir un poco
+        current_status = "Subiendo a altura inicial..."
         tello.move_up(30)
         time.sleep(2)
 
+        # Calcular el índice del último waypoint (retorno a base)
+        total_waypoints = len(wpX)
+        last_waypoint_index = total_waypoints - 1
+
         # Recorrer waypoints
-        for i in range(len(wpX)):
+        for i in range(total_waypoints):
             dx = wpX[i] - positionX
             dy = wpY[i] - positionY
 
@@ -323,10 +357,13 @@ def main():
             # Distancia (en celdas * 60 cm)
             distance = int(math.sqrt(dx**2 + dy**2) * 60)
 
-            print(f"\n=== Waypoint {i+1}/{len(wpX)} → ({wpX[i]}, {wpY[i]}) ===")
+            print(f"\n=== Waypoint {i+1}/{total_waypoints} → ({wpX[i]}, {wpY[i]}) ===")
             print(f"  Δx={dx}, Δy={dy}")
             print(f"  Giro relativo: {turn_angle}°")
             print(f"  Distancia:     {distance} cm (aprox)")
+
+            # Verificar si es el waypoint de retorno a base
+            is_return_to_base = (i == last_waypoint_index)
 
             # Giro
             if abs(turn_angle) > 5:
@@ -335,24 +372,20 @@ def main():
 
             # Avance (limitado a rango seguro de Tello)
             distance_clamped = max(20, min(500, distance))
+            current_status = f"Avanzando {distance_clamped}cm al waypoint {i+1}..."
             tello.move_forward(distance_clamped)
             time.sleep(1)
             print("  ✓ Waypoint alcanzado")
 
-            # ----- NUEVO: HOVER CON CÁMARA ACTIVA -----
+            # ----- HOVER CON CÁMARA ACTIVA -----
+            if is_return_to_base:
+                current_status = f"Base alcanzada - Preparando aterrizaje"
+            else:
+                current_status = f"Waypoint {i+1} - Hover ({WAYPOINT_HOVER_TIME}s)"
+            
             hover_start = time.time()
             while time.time() - hover_start < WAYPOINT_HOVER_TIME:
-                frame = frame_read.frame
-                if frame is None:
-                    continue
-                frame = cv2.flip(frame, 0)
-                img = fix_image(frame)
-                cv2.putText(img, f"Waypoint {i+1} hover",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
-                cv2.imshow("Correction View", img)
-                cv2.waitKey(1)
-                time.sleep(0.03)
+                time.sleep(0.1)
             # ------------------------------------------
 
             # Actualizar pose "ideal"
@@ -360,14 +393,17 @@ def main():
             positionY = wpY[i]
             heading = target_angle
 
-            # Fase de corrección: centrarse en "Fire" + maniobra / subida si no ve
-            correction_phase()
+            # Fase de corrección: SOLO si NO es el último waypoint (retorno a base)
+            if not is_return_to_base:
+                correction_phase()
 
         print("\nRuta completada. Aterrizando...")
+        current_status = "Aterrizando..."
         tello.land()
 
     except KeyboardInterrupt:
         print("\nInterrumpido por el usuario (KeyboardInterrupt).")
+        current_status = "Interrumpido - Aterrizando"
         try:
             tello.land()
         except Exception:
@@ -375,12 +411,15 @@ def main():
 
     except Exception as e:
         print("\nError en ejecución:", e)
+        current_status = f"Error: {e}"
         try:
             tello.land()
         except Exception:
             pass
 
     finally:
+        running = False
+        time.sleep(0.5)
         tello.streamoff()
         cv2.destroyAllWindows()
         tello.end()
