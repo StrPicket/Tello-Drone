@@ -22,7 +22,7 @@ CORRECTION_TIME = 5.0
 INFERENCE_SIZE = 224
 
 # ROI para pipes
-ROI_LEFT = 120
+ROI_LEFT = 10
 ROI_RIGHT = 1000
 ROI_TOP = 0
 ROI_BOTTOM = 480
@@ -373,6 +373,7 @@ def detect_fire(segment_idx, segment_seen_prev):
             cx, cy = best_center
             
             if segment_seen_prev:
+                print(f"Detectado en segmento previo, recortando ROI, line: {limit_line}, fireY: {cy}")
                 if cy < limit_line:
                     wp.append(segment_idx)
                     print(f"    🔥 Fuego seg {segment_idx}")
@@ -403,8 +404,10 @@ def run_route():
             move_and_stabilize()
             start = time.time()
 
+            segment_seen = False  # Inicializar antes del while
             while (time.time() - start) < 2.5:
-                segment_seen = detect_fire(segment_counter, segment_seen_prev)
+                if detect_fire(segment_counter, segment_seen_prev):
+                    segment_seen = True  # Acumular detecciones
             
             if j < 5:
                 pipes = count_pipes(samples=5)
@@ -412,7 +415,7 @@ def run_route():
                 if 0 < pipes <= 2:
                     correction_phase()
 
-            segment_seen_prev = False if j == 0 else segment_seen
+            segment_seen_prev = segment_seen
         
         rotate_left()
         
@@ -423,16 +426,18 @@ def run_route():
             move_and_stabilize()
             start = time.time()
             
+            segment_seen = False  # Inicializar antes del while
             while (time.time() - start) < 2.5:
-                segment_seen = detect_fire(segment_counter, segment_seen_prev)
-
-            segment_seen_prev = False if j == 0 else segment_seen
+                if detect_fire(segment_counter, segment_seen_prev):
+                    segment_seen = True  # Acumular detecciones
             
             if j < 6:
                 pipes = count_pipes(samples=5)
                 print(f"    📊 Pipes: {pipes}")
                 if 0 < pipes <= 2:
                     correction_phase()
+
+            segment_seen_prev = segment_seen
         
         rotate_left()
         
@@ -489,4 +494,4 @@ if __name__ == "__main__":
         tello.land()
         tello.streamoff()
         cv2.destroyAllWindows()
-        print("poñoñin yolo-prefinal")
+        print("poñoñin completed") 
