@@ -21,6 +21,11 @@ MAX_SPEED = 18
 CORRECTION_TIME = 5.0
 INFERENCE_SIZE = 224
 
+# Control de YAW
+KP_YAW = 1.12
+YAW_DEADZONE = 25
+MAX_YAW_SPEED = 30
+
 # ROI para pipes
 ROI_LEFT = 10
 ROI_RIGHT = 1000
@@ -87,6 +92,34 @@ def get_mask_centroid(mask, w, h):
         return int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
     return None, None
 
+def get_pipe_alignment_points(mask, w, h):
+    """Extrae punto superior e inferior de la pipe para corrección de yaw"""
+    mask_resized = cv2.resize(mask, (w, h))
+    mask_bin = (mask_resized > 0.5).astype(np.uint8)
+    
+    contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None
+    
+    largest_contour = max(contours, key=cv2.contourArea)
+    h_third = h // 3
+    
+    top_points = largest_contour[largest_contour[:, 0, 1] < h_third]
+    if len(top_points) > 0:
+        top_x = int(np.mean(top_points[:, 0, 0]))
+        top_y = int(np.mean(top_points[:, 0, 1]))
+    else:
+        return None, None
+    
+    bottom_points = largest_contour[largest_contour[:, 0, 1] > 2*h_third]
+    if len(bottom_points) > 0:
+        bottom_x = int(np.mean(bottom_points[:, 0, 0]))
+        bottom_y = int(np.mean(bottom_points[:, 0, 1]))
+    else:
+        return None, None
+    
+    return (top_x, top_y), (bottom_x, bottom_y)
+
 def draw_segmentation(frame, results):
     """Dibuja las máscaras de segmentación"""
     if not results or len(results) == 0:
@@ -136,6 +169,15 @@ def draw_segmentation(frame, results):
         (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(overlay, (x1, y1 - text_height - 10), (x1 + text_width, y1), color, -1)
         cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        top_pt, bottom_pt = get_pipe_alignment_points(mask, w, h)
+        if top_pt is not None and bottom_pt is not None:
+            cv2.circle(overlay, top_pt, 6, (0, 255, 255), -1)
+            cv2.circle(overlay, bottom_pt, 6, (0, 255, 255), -1)
+            cv2.line(overlay, top_pt, bottom_pt, (0, 255, 255), 2)
+            yaw_error = top_pt[0] - bottom_pt[0]
+            cv2.putText(overlay, f"yaw:{yaw_error}", (cx+15, cy+20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
         # Centroide para pipes
         if class_name.lower() in ['pipes', 'pipe']:
@@ -254,6 +296,7 @@ def correction_phase():
     prev_time = time.time()
     start_time = time.time()
     error_buffer = deque(maxlen=4)
+    yaw_buffer = deque(maxlen=3)
     last_control = 0
     
     while time.time() - start_time < CORRECTION_TIME:
@@ -298,15 +341,24 @@ def correction_phase():
                 
                 mask = result.masks.data[best_idx].cpu().numpy()
                 cx, cy = get_mask_centroid(mask, w, h)
+                # Control de yaw (rotación)
+                top_pt, bottom_pt = get_pipe_alignment_points(mask, w, h)
                 
                 if cx is not None:
+                    if top_pt is not None and bottom_pt is not None:
+                        yaw_error = top_pt[0] - bottom_pt[0]
+                        
+                        yaw_buffer.append(yaw_error)
+                        yaw_filtered = int(np.mean(yaw_buffer))
+                                                  
                     error = cx - center_x
                     
                     error_buffer.append(error)
                     error_filtered = int(np.mean(error_buffer))
                     
-                    if abs(error_filtered) < DEADZONE:
+                    if abs(error_filtered) < DEADZONE and abs(yaw_filtered) < YAW_DEADZONE:
                         control = int(np.clip(error_filtered * 0.08, -8, 8))
+
                     else:
                         p_term = KP * error_filtered
                         d_term = KD * (error_filtered - prev_error) / dt
@@ -316,15 +368,18 @@ def correction_phase():
                         if control_change > 10:
                             control = last_control + np.sign(control - last_control) * 10
                         
+                        yaw_control = -int(KP_YAW * yaw_filtered)
+                        yaw_control = int(np.clip(yaw_control, -MAX_YAW_SPEED, MAX_YAW_SPEED))
                         control = int(np.clip(control, -MAX_SPEED, MAX_SPEED))
                     
-                    tello.send_rc_control(control, 0, 0, 0)
+                    tello.send_rc_control(control, 0, 0, -yaw_control)
                     prev_error = error_filtered
                     last_control = control
         
         if not pipe_found:
             tello.send_rc_control(0, 0, 0, 0)
             error_buffer.clear()
+            yaw_buffer.clear()
         
         prev_time = current_time
         time.sleep(0.05)
