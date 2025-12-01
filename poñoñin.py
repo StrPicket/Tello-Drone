@@ -401,7 +401,7 @@ def detect_fire(segment_idx, segment_seen_prev):
     h, w = frame.shape[:2]
     limit_line = int(h * HEIGHT_LIMIT_RATIO)
     
-    results = model(frame, conf=0.6, verbose=False)
+    results = model(frame, conf=0.4, verbose=False)
     
     if results and results[0].boxes is not None:
         result = results[0]
@@ -472,9 +472,21 @@ def run_route():
                 if 0 < pipes <= 2:
                     correction_phase()
 
+            start = time.time()
+            while (time.time() - start) < 2.5:
+                if detect_fire(segment_counter, segment_seen_prev):
+                    segment_seen = True  # Acumular detecciones
+
             segment_seen_prev = segment_seen
+            
         
         rotate_left()
+        start = time.time()
+        while (time.time() - start) < 2.5:
+            if detect_fire(segment_counter, segment_seen_prev):
+                segment_seen = True  # Acumular detecciones
+
+
         
         for j in range(7):
             segment_counter += 1
@@ -494,9 +506,18 @@ def run_route():
                 if 0 < pipes <= 2:
                     correction_phase()
 
+            start = time.time()
+            while (time.time() - start) < 2.5:
+                if detect_fire(segment_counter, segment_seen_prev):
+                    segment_seen = True  # Acumular detecciones
+
             segment_seen_prev = segment_seen
         
         rotate_left()
+        start = time.time()
+        while (time.time() - start) < 2.5:
+            if detect_fire(segment_counter, segment_seen_prev):
+                segment_seen = True  # Acumular detecciones
         
     wp_unique = list(dict.fromkeys(wp))
     for i in wp_unique:
