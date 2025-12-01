@@ -50,7 +50,7 @@ TARGET_CLASS = "Fire"       # clase objetivo
 # Control lateral PD
 KP = 0.25
 KD = 0.2
-DEADZONE = 60
+DEADZONE = 20
 MAX_SPEED = 18              # velocidad lateral máx
 
 CORRECTION_TIME = 15.0      # ⬅️ más tiempo de corrección por waypoint (s)
@@ -64,7 +64,7 @@ CENTER_TOLERANCE = 25       # píxeles alrededor del centro
 DETECTION_STABLE_FRAMES = 5 # nº de frames seguidos centrado
 
 # Altura de la maniobra al encontrar Fire
-ALTITUDE_DELTA_CM = 40      # baja 20cm y luego sube 20cm
+ALTITUDE_DELTA_CM = 20      # baja 20cm y luego sube 20cm
 
 # Transformación de imagen (igual que tu script que ya funciona)
 FLIP_HORIZONTAL = True     # Mirror

@@ -22,7 +22,7 @@ CORRECTION_TIME = 5.0
 INFERENCE_SIZE = 224
 
 # Control de YAW
-KP_YAW = 1.12
+KP_YAW = 0.5
 YAW_DEADZONE = 25
 MAX_YAW_SPEED = 30
 
@@ -170,14 +170,6 @@ def draw_segmentation(frame, results):
         cv2.rectangle(overlay, (x1, y1 - text_height - 10), (x1 + text_width, y1), color, -1)
         cv2.putText(overlay, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        top_pt, bottom_pt = get_pipe_alignment_points(mask, w, h)
-        if top_pt is not None and bottom_pt is not None:
-            cv2.circle(overlay, top_pt, 6, (0, 255, 255), -1)
-            cv2.circle(overlay, bottom_pt, 6, (0, 255, 255), -1)
-            cv2.line(overlay, top_pt, bottom_pt, (0, 255, 255), 2)
-            yaw_error = top_pt[0] - bottom_pt[0]
-            cv2.putText(overlay, f"yaw:{yaw_error}", (cx+15, cy+20), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
         # Centroide para pipes
         if class_name.lower() in ['pipes', 'pipe']:
@@ -187,6 +179,14 @@ def draw_segmentation(frame, results):
                 error = cx - center_x
                 cv2.line(overlay, (center_x, cy), (cx, cy), color, 2)
                 cv2.putText(overlay, f"e:{error}", (cx+15, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                top_pt, bottom_pt = get_pipe_alignment_points(mask, w, h)
+                if top_pt is not None and bottom_pt is not None:
+                    cv2.circle(overlay, top_pt, 6, (0, 255, 255), -1)
+                    cv2.circle(overlay, bottom_pt, 6, (0, 255, 255), -1)
+                    cv2.line(overlay, top_pt, bottom_pt, (0, 255, 255), 2)
+                    yaw_error = top_pt[0] - bottom_pt[0]
+                    cv2.putText(overlay, f"yaw:{yaw_error}", (cx+15, cy+20), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
     
     return overlay
 
@@ -297,6 +297,8 @@ def correction_phase():
     start_time = time.time()
     error_buffer = deque(maxlen=4)
     yaw_buffer = deque(maxlen=3)
+    yaw_filtered = 0
+    yaw_control = 0
     last_control = 0
     
     while time.time() - start_time < CORRECTION_TIME:
