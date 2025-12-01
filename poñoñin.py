@@ -551,4 +551,4 @@ if __name__ == "__main__":
         tello.land()
         tello.streamoff()
         cv2.destroyAllWindows()
-        print("poñoñin completed") 
+        print("poñoñin yaw completed") 
