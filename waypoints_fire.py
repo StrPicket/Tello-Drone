@@ -16,6 +16,8 @@ from ultralytics import YOLO
 wpX = []
 wpY = []
 
+already_lifted = False
+
 try:
     with open("waypoints.csv", "r") as f:
         reader = csv.reader(f)
@@ -53,7 +55,7 @@ KD = 0.2
 DEADZONE = 20
 MAX_SPEED = 18              # velocidad lateral máx
 
-CORRECTION_TIME = 15.0      # ⬅️ más tiempo de corrección por waypoint (s)
+CORRECTION_TIME = 20.0      # ⬅️ más tiempo de corrección por waypoint (s)
 INFERENCE_SIZE = 224
 FRAME_SKIP = 2              # saltar frames para no saturar CPU
 
@@ -64,7 +66,7 @@ CENTER_TOLERANCE = 25       # píxeles alrededor del centro
 DETECTION_STABLE_FRAMES = 5 # nº de frames seguidos centrado
 
 # Altura de la maniobra al encontrar Fire
-ALTITUDE_DELTA_CM = 20      # baja 20cm y luego sube 20cm
+ALTITUDE_DELTA_CM = 30     # baja 20cm y luego sube 20cm
 
 # Transformación de imagen (igual que tu script que ya funciona)
 FLIP_HORIZONTAL = True     # Mirror
@@ -161,7 +163,7 @@ def correction_phase():
     """
     Lógica de corrección con detección YOLO en el hilo de video.
     """
-    global frame_read, model, tello, current_status
+    global frame_read, model, tello, current_status, already_lifted
 
     print("  → correction_phase INICIADA")
     current_status = "Buscando Fire..."
@@ -173,8 +175,6 @@ def correction_phase():
     error_bufferX = deque(maxlen=4)
     error_bufferY = deque(maxlen=4)
     start_time = time.time()
-
-    already_lifted = False
 
     while True:
         # Timeout general
@@ -258,7 +258,7 @@ def correction_phase():
 
         if abs(err_filtered) < DEADZONE and abs(err_filteredY) < DEADZONE:
             control = int(np.clip(err_filtered * 0.08, -8, 8))
-            controlY = 0
+            controlY = int(np.clip(err_filteredY * 0.08, 8, 8))
         else:
             p_term = KP * err_filtered
             d_term = KD * (err_filtered - prev_error) / dt
@@ -268,34 +268,40 @@ def correction_phase():
 
         prev_error = err_filtered
 
-        tello.send_rc_control(control, 0, -controlY, 0)
-        current_status = f"Fire detectado - Centrando (err={err_filtered}, ctrl={control})"
+        tello.send_rc_control(control, controlY, 0, 0)
+        current_status = f"Fire detectado - Centrando (err={err_filtered}, errY={controlY})"
 
         # Comprobar centrado
-        if abs(err_filtered) < CENTER_TOLERANCE:
+        if abs(err_filtered) < CENTER_TOLERANCE and abs(err_filteredY) < CENTER_TOLERANCE :
             stable_center_frames += 1
         else:
             stable_center_frames = 0
 
         # Si lleva varios frames centrado → maniobra y salir
         if stable_center_frames >= DETECTION_STABLE_FRAMES:
-            print("  ✓ Fire centrado. Ejecutando maniobra bajada/subida...")
-            current_status = "Fire centrado - Ejecutando maniobra"
-            tello.send_rc_control(0, 0, 0, 0)
-            time.sleep(0.5)
+            break
 
-            current_status = "Bajando 40cm..."
-            tello.move_down(ALTITUDE_DELTA_CM)
-            time.sleep(3.0)
-            
-            current_status = "Subiendo 40cm..."
-            tello.move_up(ALTITUDE_DELTA_CM)
-            time.sleep(0.5)
+    print("  ✓ Fire centrado. Ejecutando maniobra bajada/subida...")
+    current_status = "Fire centrado - Ejecutando maniobra"
+    tello.send_rc_control(0, 0, 0, 0)
+    time.sleep(0.5)
 
-            print("  ✓ Maniobra completada. Saliendo de correction_phase.")
-            tello.send_rc_control(0, 0, 0, 0)
-            current_status = "Maniobra completada"
-            return
+    current_status = "Bajando 40cm..."
+    tello.move_down(ALTITUDE_DELTA_CM)
+    time.sleep(3.0)
+    if already_lifted:
+        tello.move_down(ALTITUDE_DELTA_CM)
+        time.sleep(3.0)
+        already_lifted = False
+    
+    current_status = "Subiendo 40cm..."
+    tello.move_up(ALTITUDE_DELTA_CM)
+    time.sleep(0.5)
+
+    print("  ✓ Maniobra completada. Saliendo de correction_phase.")
+    tello.send_rc_control(0, 0, 0, 0)
+    current_status = "Maniobra completada"
+    return
 
 
 # ============================================================
@@ -333,12 +339,12 @@ def main():
         # Despegue
         current_status = "Despegando..."
         tello.takeoff()
-        time.sleep(2)
+        time.sleep(3)
 
         # (opcional) subir un poco
         current_status = "Subiendo a altura inicial..."
-        tello.move_up(30)
-        time.sleep(2)
+        tello.move_up(40)
+        time.sleep(3)
 
         # Calcular el índice del último waypoint (retorno a base)
         total_waypoints = len(wpX)

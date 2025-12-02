@@ -33,11 +33,11 @@ ROI_TOP = 0
 ROI_BOTTOM = 480
 
 # ROI exclusivo para fuegos
-FIRE_ROI_LEFT = 300
-FIRE_ROI_RIGHT = 680
+FIRE_ROI_LEFT = 200
+FIRE_ROI_RIGHT = 800
 
 # Límite vertical
-HEIGHT_LIMIT_RATIO = 0.15
+HEIGHT_LIMIT_RATIO = 0.1
 
 # Colores BGR
 COLORS = [
@@ -243,6 +243,13 @@ def move_and_stabilize(distance=60):
     time.sleep(1.0)
     tello.send_rc_control(0, 0, 0, 0)
     time.sleep(1.0)
+
+    # Frenar activamente con comando de retroceso breve
+    tello.send_rc_control(0, -10, 0, 0)
+    time.sleep(0.3)
+    
+    tello.send_rc_control(0, 0, 0, 0)
+    time.sleep(1.5)  # Más tiempo para estabilizar
 
 def rotate_left():
     global in_correction_mode
@@ -485,8 +492,6 @@ def run_route():
         while (time.time() - start) < 2.5:
             if detect_fire(segment_counter, segment_seen_prev):
                 segment_seen = True  # Acumular detecciones
-
-
         
         for j in range(7):
             segment_counter += 1
