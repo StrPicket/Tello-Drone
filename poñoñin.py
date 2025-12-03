@@ -356,9 +356,11 @@ def correction_phase():
                 if cx is not None:
                     if top_pt is not None and bottom_pt is not None:
                         yaw_error = top_pt[0] - bottom_pt[0]
+                    else:
+                        yaw_error = 0
                         
-                        yaw_buffer.append(yaw_error)
-                        yaw_filtered = int(np.mean(yaw_buffer))
+                    yaw_buffer.append(yaw_error)
+                    yaw_filtered = int(np.mean(yaw_buffer))
                                                   
                     error = cx - center_x
                     
